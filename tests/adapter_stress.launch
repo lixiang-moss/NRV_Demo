@@ -1,0 +1,14 @@
+<launch>
+  <arg name="port" />
+  <arg name="compact" />
+  <arg name="summary_path" />
+  <node name="stress_manager" pkg="nodelet" type="nodelet" args="manager" output="screen" />
+  <node name="stress_adapter" pkg="nodelet" type="nodelet"
+        args="load nrv_demo/DvsAdapterNodelet /stress_manager" output="screen">
+    <param name="input_topic" value="/nrv_stress/events" />
+    <param name="bridge_host" value="127.0.0.1" />
+    <param name="bridge_port" value="$(arg port)" />
+    <param name="bridge_compact" value="$(arg compact)" />
+    <param name="summary_path" value="$(arg summary_path)" />
+  </node>
+</launch>

@@ -4,12 +4,15 @@
   <arg name="sensor_setting_path" default="/opt/ros/noetic/share/delta_driver/config/sensor/Delta_01_1000FPS.txt" />
   <arg name="decode_events" default="true" />
   <arg name="show_gui" default="true" />
+  <arg name="run_algorithm" default="true" />
+  <arg name="run_renderer" default="true" />
   <arg name="duration" default="0" />
   <arg name="output_dir" default="/output/manual" />
   <arg name="message_threshold_time_ms" default="10" />
   <arg name="image_fps" default="10" />
   <arg name="bridge_host" default="127.0.0.1" />
   <arg name="bridge_port" default="0" />
+  <arg name="bridge_compact" default="false" />
 
   <node name="delta_manager" pkg="nodelet" type="nodelet" args="manager" required="true" output="screen" />
   <node name="delta_driver" pkg="nodelet" type="nodelet"
@@ -31,14 +34,20 @@
         <param name="input_topic" value="/delta_driver/events" />
         <param name="output_topic" value="events" />
         <param name="camera_info_topic" value="camera_info" />
+        <param name="bridge_host" value="$(arg bridge_host)" />
+        <param name="bridge_port" value="$(arg bridge_port)" />
+        <param name="bridge_compact" value="$(arg bridge_compact)" />
+        <param name="summary_path" value="$(arg output_dir)/adapter_summary.json" />
       </node>
     </group>
-    <node name="delta_renderer" pkg="nodelet" type="nodelet"
-          args="load delta_tools/RendererNodelet /delta_manager" output="screen">
-      <param name="topic" value="/delta_driver/events" />
-      <param name="image_fps" value="$(arg image_fps)" />
-      <param name="subscriber_queue_size" value="1" />
-    </node>
+    <group if="$(arg run_renderer)">
+      <node name="delta_renderer" pkg="nodelet" type="nodelet"
+            args="load delta_tools/RendererNodelet /delta_manager" output="screen">
+        <param name="topic" value="/delta_driver/events" />
+        <param name="image_fps" value="$(arg image_fps)" />
+        <param name="subscriber_queue_size" value="1" />
+      </node>
+    </group>
     <group if="$(arg show_gui)">
       <node name="nrv_input_view" pkg="rqt_image_view" type="rqt_image_view" args="/delta_renderer/image" />
       <node name="nrv_algorithm_view" pkg="rqt_image_view" type="rqt_image_view" args="/nrv_python_demo/image" />
@@ -47,10 +56,11 @@
 
   <node name="nrv_python_demo" pkg="nrv_demo" type="demo.py" required="true" output="screen">
     <param name="decode_events" value="$(arg decode_events)" />
+    <param name="run_algorithm" value="$(arg run_algorithm)" />
     <param name="duration" value="$(arg duration)" />
     <param name="image_fps" value="$(arg image_fps)" />
     <param name="output_dir" value="$(arg output_dir)" />
     <param name="bridge_host" value="$(arg bridge_host)" />
-    <param name="bridge_port" value="$(arg bridge_port)" />
+    <param name="bridge_port" value="0" />
   </node>
 </launch>

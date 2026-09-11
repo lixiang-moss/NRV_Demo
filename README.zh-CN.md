@@ -55,8 +55,9 @@ CAMERA_INDEX=1 ./scripts/run.sh
 ## 实时 E2FAI 图像与光流
 
 `run_e2fai.sh` 保留 Docker 中的 NRV ROS 驱动和解码器，在宿主机 GPU 上
-运行模型。窗口同步显示三列：白底 events、E2FAI 加循环 image residual、
-原始带 pooling 的 E2FAI flow。
+运行模型。窗口同步显示两列：E2FAI 加循环 image residual 和原始带 pooling
+的 E2FAI flow。事件预览不在实时窗口中重复渲染，以避免把完整 voxel 从 GPU
+拷回 CPU。
 
 最小模型代码已放在本项目中；checkpoint 保存在本机并由 Git 忽略。启动脚本
 支持下面任意一种布局：
@@ -91,6 +92,9 @@ conda activate nrv-e2fai
 # 选择另一张物理 GPU，并录制显示结果
 GPU=1 RECORD=true ./scripts/run_e2fai.sh
 
+# 可选：相机保持 960×720，模型/image/flow 降为 640×480
+RESOLUTION=640x480 ./scripts/run_e2fai.sh
+
 # 无窗口运行（仍保存 summary.json 和最后一帧）
 HEADLESS=true DURATION=30 ./scripts/run_e2fai.sh
 ```
@@ -98,8 +102,98 @@ HEADLESS=true DURATION=30 ./scripts/run_e2fai.sh
 可通过 `PYTHON`、`IMAGE_CHECKPOINT`、`BACKBONE_CHECKPOINT` 覆盖解释器或
 权重路径。结果写入
 `output/e2fai_*`。默认输入为不重叠的 100 ms、15-bin、720×960 voxel；
-可用 `WINDOW_MS=...` 修改时间窗。DELTA01 事件直接使用原生 960×720 分辨率，
-不 crop、也不 resize；flow 单位是每个时间窗内的原生传感器像素。
+可用 `WINDOW_MS=...` 修改时间窗。默认 `RESOLUTION=960x720` 使用原生分辨率；
+`RESOLUTION=640x480` 在构建 voxel 前将事件坐标按比例向下取整映射到低分辨率
+网格，保留完整视野，同像素事件累加。相机采集与 bridge 的事件数量不会因此减少。
+`SENSOR_WIDTH`/`SENSOR_HEIGHT` 仍表示真实相机尺寸，请不要用它们设置推理降采样。
+推理尺寸必须不大于相机尺寸、保持相同宽高比，且宽高均为 16 的倍数。
+
+image/flow 直接输出为选定的推理分辨率。flow 单位为每个输入时间窗内的**推理网格
+像素**；640×480 下换算回 960×720 的像素位移时，水平和垂直分量均乘 `1.5`。
+降采样会损失空间细节并改变事件密度，画质需结合场景检查。
+summary 中 `mean_frame_processing_ms` 包含 voxel、模型、渲染以及启用的录像/GUI
+调用，但不含等待和组装输入；`output_fps` 根据首末输出帧的实际间隔计算。
+100 ms 固定窗口的目标输出为 10 FPS；降低分辨率主要增加处理余量，并不会自动
+提高这个目标。可用 `RESOLUTION=640x480 WINDOW_MS=50 ./scripts/run_e2fai.sh`
+尝试 20 FPS，但这也改变了模型输入的时间尺度。
+
+紧凑传输优化前的 RTX A4000 实测（2026-09-11，开启 image/flow GUI、不录像，单次 20–30 秒）：
+
+| 推理尺寸 / 时间窗 | 平均推理 | 平均每帧处理（含 GUI） | 实际输出 | bridge 缺失批次 |
+| --- | ---: | ---: | ---: | ---: |
+| 960×720 / 100 ms | 67.0 ms | 95.8 ms | 10.09 FPS | 0 |
+| 640×480 / 100 ms | 32.0 ms | 57.8 ms | 9.14 FPS | 133 |
+| 640×480 / 50 ms | 31.5 ms | 49.0 ms | 18.43 FPS | 0 |
+| 640×480 / 66.667 ms | 31.1 ms | 57.9 ms | 10.41 FPS | 295 |
+
+这些是不同实时输入、不是同一段数据的回放对比。低分辨率 100 ms 和 66.667 ms
+测试中出现了持续约 35–50 MB/s 的 RAW 数据流和适配器序号缺口；原分辨率测试
+大部分约为 5 MB/s。降低分辨率确实减轻了推理负担，但不保证高事件率下稳定
+15/20 FPS；零 bridge 缺口也不能证明全链路无损。这些帧率不是传感器到屏幕的延迟。
+
+实时路径由 C++ 解码器直接发送事件，宿主机独立线程持续接收，默认形成连续的
+100 ms 固定窗口，以减轻接收与推理相互阻塞。高事件率下仍可能发生解码或发送
+队列丢包；降低推理分辨率不降低上游数据率。`sender_dropped_batches_observed`
+记录接收端观察到的 bridge 序号缺口，并不代表全链路丢包总数。NRV 的
+`group_aer` 解码时间戳存在错误的长周期跳变，因此适配器按相邻 RAW 包的宿主机
+到达时间为包内事件生成单调时间。若机器无法维持固定窗口速度，可用
+`STRICT_WINDOWS=false ./scripts/run_e2fai.sh` 合并当前积压批次以优先保证低延迟。
+
+### 上游传输与丢包诊断
+
+E2FAI 启动脚本现在默认启用 `BRIDGE_COMPACT=true`。NRV2 只传每个事件的
+`x/y/polarity`（5 字节，而非 NRV1 的 13 字节），包头携带起止时间和累计 RAW
+缺口计数。宿主机用整数插值恢复原有的包内时间策略，保持事件次序、坐标和极性；
+这并没有修复或恢复真实传感器时间戳。没有 ROS 事件订阅者时，不再构造中间
+`dvs_msgs/EventArray`。固定时间窗口使用分块缓存，窗口完整后才按字节合并一次。
+
+更新 C++ 代码后需执行 `./scripts/build.sh`。可用 `BRIDGE_COMPACT=false`
+回退到 NRV1；宿主机接收器兼容两种协议。NRV2 格式为原有 20 字节 `!4sIIII`
+包头（magic=`NRV2`），再接 32 字节 `!QQQQ`（起止纳秒时间、RAW 缺失包数、
+RAW 乱序/重置次数），最后接 `count` 个 `<u2,<u2,u1` 事件。
+
+`adapter_summary.json` 区分 `raw_missing_packets`（适配器订阅端缺口）、
+`bridge_overflow_batches`（发送队列满）、`bridge_send_failed_batches`（发送失败）
+及 `bridge_shutdown_discarded_batches`（退出时未发送）。发送队列仍有 64 包、
+256 MiB 上限，处理长期跟不上时仍会丢弃旧批次，不能把它当作无损录像通道。
+`e2fai_summary.json` 的 `pipeline` 合并 RAW 监视器与适配器报告；
+`upstream_loss_detected=null` 表示报告不完整，不能按零丢包解释。NRV2 的上游
+缺口还会触发模型循环状态重置。退出时已收到但未处理的批次单独记在
+`bridge_unprocessed_batches_at_shutdown`。
+
+推理端原有的每窗口 100 万事件抽样上限仍保留，与传输丢包是两回事；现在显式
+记录 `voxel_input_events`、`voxel_kept_events`、`voxel_subsampled_windows`。
+可用 `MAX_EVENTS=...` 调整上限，增大它会增加 voxel 处理开销。所有丢包计数为零
+只表示这些观测点未发现缺口，不证明相机/USB 内部无损，也不代表没有推理抽样。
+
+可重复的上游压力测试（不使用相机或模型）：
+
+```bash
+mkdir -p output
+stress_dir=$(mktemp -d "${PWD}/output/stress_XXXXXX")
+docker run --rm --network host -v "${PWD}:/workspace:ro" -v "${stress_dir}:/results" \
+  nrv-demo:noetic python3 /workspace/tests/stress_adapter.py --protocol NRV2 --output-dir /results
+```
+
+测试独立启动 ROS master，以 100 包/秒发送每包 40 万个事件，共 500 包；将协议
+改为 `NRV1` 可对照。本机同一合成输入下，NRV1 适配器订阅端缺失 8 包、平均
+打包 9.61 ms/包、最大包龄 1086 ms；NRV2 完整接收 500 包共 2 亿事件、
+平均打包 0.25 ms/包、最大包龄 1.20 ms。这里的包龄是发布到适配器回调的时间，
+不是传感器到屏幕的延迟；这个测试也不代表 E2FAI 能处理每秒 4000 万事件。
+
+宿主机接收、组窗、voxel、真实模型与渲染也可独立压测（无 GUI，保留推理抽样上限）：
+
+```bash
+stress_dir=$(mktemp -d "${PWD}/output/stress_host_XXXXXX")
+PYTHONPATH=runtime python tests/stress_e2fai_host.py --output-dir "${stress_dir}"
+```
+
+这个测试发送每秒 2000 万个空间分布事件，共 10 秒，并要求完整接收 1000 包、
+处理 100 个时间窗口、输出至少 9.5 FPS，退出时接收队列无剩余批次。
+本机实测完整收到 2 亿事件、输出 10.04 FPS；其中送入 voxel 的事件按既有上限
+抽样为 1 亿，不能把这个结果解释成全事件推理。最终版本的两轮 30 秒相机 GUI
+测试（主要约 5 MB/s RAW）输出约 10.07–10.09 FPS，RAW/适配器/TCP 计数未观察
+到丢包；持续高事件率的真实相机整链路仍需另行验证。
 
 当前相机适配不做相机矫正；在获得 NRV 标定和微调数据前，相对 DSEC 会存在
 domain shift。

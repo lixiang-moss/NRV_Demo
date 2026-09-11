@@ -55,9 +55,9 @@ CAMERA_INDEX=1 ./scripts/run.sh
 ## Real-time E2FAI image and flow
 
 `run_e2fai.sh` keeps the NRV ROS driver/decoder in Docker and runs the GPU model
-on the host. It displays a synchronized three-panel view: white-background
-events, E2FAI plus the recurrent image residual, and the original pooled E2FAI
-flow.
+on the host. It displays synchronized E2FAI image and flow panels. The event
+preview is not rendered again because copying the full voxel from GPU to CPU
+would slow down the live path.
 
 The minimal model runtime is bundled in this repository. Checkpoints are kept
 locally and ignored by Git. Put them either in the repository root using their
@@ -73,6 +73,9 @@ conda activate nrv-e2fai
 # Select another physical GPU; optionally record the displayed stream
 GPU=1 RECORD=true ./scripts/run_e2fai.sh
 
+# Optional: keep 960x720 capture, run the model/image/flow at 640x480
+RESOLUTION=640x480 ./scripts/run_e2fai.sh
+
 # No display (still saves summary.json and the final frame)
 HEADLESS=true DURATION=30 ./scripts/run_e2fai.sh
 ```
@@ -80,9 +83,119 @@ HEADLESS=true DURATION=30 ./scripts/run_e2fai.sh
 Override the interpreter or weights with `PYTHON`, `IMAGE_CHECKPOINT`, or
 `BACKBONE_CHECKPOINT`. Results are written below
 `output/e2fai_*`. The default input is a non-overlapping 100 ms, 15-bin,
-720×960 voxel; `WINDOW_MS=...` changes the window. DELTA01 events are processed
-at their native 960×720 resolution without crop or resize. Flow is measured in
-native sensor pixels per window.
+720×960 voxel; `WINDOW_MS=...` changes the window. `RESOLUTION=960x720` (default)
+uses native resolution. `RESOLUTION=640x480` bins event coordinates into a smaller
+grid using floor(x * input_width / sensor_width) and the equivalent y mapping
+before voxelization. It preserves the full field of view and sums colliding
+events; camera capture and bridge event counts are unchanged. `SENSOR_WIDTH`
+and `SENSOR_HEIGHT` still describe the physical camera, not inference size.
+Input dimensions must not exceed the sensor, must preserve its aspect ratio,
+and must be divisible by 16.
+
+Image and flow outputs use the selected inference resolution. Flow is in model
+input pixels per window; multiply both components by 1.5 to express 640x480
+predictions in 960x720 sensor pixels. Downsampling reduces spatial detail and
+changes event density, so evaluate image quality for your scene.
+The summary reports `mean_frame_processing_ms` (voxel, model, rendering and any
+recording/GUI calls, excluding input wait/assembly) and `output_fps` (measured
+between completed frames). A 100 ms window still targets 10 FPS; downsampling
+adds processing headroom. To try 20 FPS, use
+`RESOLUTION=640x480 WINDOW_MS=50 ./scripts/run_e2fai.sh`; this changes the model's
+input time scale as well.
+
+RTX A4000 measurements before the compact-transport optimization (2026-09-11, image/flow GUI enabled, no recording,
+20–30 seconds per run):
+
+| Input / window | Mean inference | Mean frame processing incl. GUI | Output | Missing bridge batches |
+| --- | ---: | ---: | ---: | ---: |
+| 960×720 / 100 ms | 67.0 ms | 95.8 ms | 10.09 FPS | 0 |
+| 640×480 / 100 ms | 32.0 ms | 57.8 ms | 9.14 FPS | 133 |
+| 640×480 / 50 ms | 31.5 ms | 49.0 ms | 18.43 FPS | 0 |
+| 640×480 / 66.667 ms | 31.1 ms | 57.9 ms | 10.41 FPS | 295 |
+
+These used different live inputs, not identical replay data. The reduced-resolution
+100 ms and 66.667 ms runs included sustained roughly 35–50 MB/s RAW traffic and
+adapter sequence gaps; the native-resolution run was mostly around 5 MB/s.
+Downsampling reduces inference cost but does not guarantee sustained 15/20 FPS
+under high event rates. Zero observed bridge gaps do not prove lossless capture,
+and output FPS is not a sensor-to-screen latency measurement.
+
+The C++ decoder sends events directly while a dedicated host thread continuously
+drains the bridge into continuous 100 ms windows by default, reducing contention
+between receiving and inference. Decoder or sender queues can still lose packets
+at high event rates; inference downsampling does not reduce upstream traffic.
+`sender_dropped_batches_observed` counts bridge sequence gaps seen by the receiver,
+not total losses across the entire pipeline. Because the NRV `group_aer`
+decoder exhibits spurious long-period timestamp jumps, the adapter assigns
+monotonic intra-packet times from adjacent RAW packet host-arrival timestamps.
+If the machine cannot sustain fixed-window processing, use
+`STRICT_WINDOWS=false ./scripts/run_e2fai.sh` to coalesce pending batches and
+prioritize low latency.
+
+### Upstream transport and loss diagnostics
+
+The E2FAI launcher now defaults to `BRIDGE_COMPACT=true`. NRV2 sends five bytes
+per event (`x/y/polarity`) instead of NRV1's thirteen, with packet endpoints and
+cumulative RAW gap counters in the header. Integer interpolation on the host
+preserves the existing synthetic intra-packet timing policy, event order,
+coordinates and polarity; this does not restore true sensor timestamps. When no
+ROS event subscribers exist, the adapter also skips intermediate EventArray
+objects. Fixed windows retain packet chunks and merge their bytes only once.
+
+Rebuild changed C++ code with `./scripts/build.sh`. `BRIDGE_COMPACT=false` restores
+NRV1; the host accepts both. NRV2 uses the existing 20-byte `!4sIIII` header with
+magic `NRV2`, then 32 bytes `!QQQQ` (start/end nanoseconds, RAW missing packets,
+RAW reorder/reset incidents), then `count` records of `<u2,<u2,u1`.
+
+`adapter_summary.json` separates `raw_missing_packets` (adapter subscription),
+`bridge_overflow_batches` (sender queue capacity), `bridge_send_failed_batches`
+(send failures), and `bridge_shutdown_discarded_batches` (unsent at shutdown).
+The sender remains bounded to 64 batches / 256 MiB and drops oldest batches on
+overload; this is not a lossless recorder. `e2fai_summary.json` combines the RAW
+monitor and adapter reports under `pipeline`; `upstream_loss_detected=null` means
+incomplete diagnostics, not zero loss. NRV2 upstream gaps reset recurrent state.
+Received-but-unprocessed batches at exit are counted separately under
+`bridge_unprocessed_batches_at_shutdown`.
+
+The existing one-million-event voxel sampling limit remains separate from
+transport loss. `voxel_input_events`, `voxel_kept_events`, and
+`voxel_subsampled_windows` expose it; `MAX_EVENTS=...` adjusts the limit at the
+cost of voxel processing time. Zero gap counters neither prove lossless
+camera/USB capture nor mean that inference used every event.
+
+Repeatable upstream stress test (no camera or model):
+
+```bash
+mkdir -p output
+stress_dir=$(mktemp -d "${PWD}/output/stress_XXXXXX")
+docker run --rm --network host -v "${PWD}:/workspace:ro" -v "${stress_dir}:/results" \
+  nrv-demo:noetic python3 /workspace/tests/stress_adapter.py --protocol NRV2 --output-dir /results
+```
+
+This starts an isolated ROS master and sends 500 packets at 100 Hz, each with
+400,000 events. Use `--protocol NRV1` for comparison. With identical synthetic
+input here, NRV1 missed eight packets at the adapter subscription, averaging
+9.61 ms/packet packing with a maximum packet age of 1086 ms. NRV2 received all
+500 packets / 200 million events, averaging 0.25 ms packing and 1.20 ms maximum
+packet age. Packet age measures publisher-to-adapter time, not sensor-to-screen
+latency; this test does not claim E2FAI can infer 40 million events per second.
+
+The host receiver/window/voxel/real-model/render path has a separate stress test
+(headless, with the existing inference sampling limit retained):
+
+```bash
+stress_dir=$(mktemp -d "${PWD}/output/stress_host_XXXXXX")
+PYTHONPATH=runtime python tests/stress_e2fai_host.py --output-dir "${stress_dir}"
+```
+
+It supplies 20 million spatially distributed events/second for ten seconds and
+requires all 1,000 batches, 100 processed windows, at least 9.5 output FPS, and
+no received batches left unprocessed at shutdown.
+The local run received all 200 million events at 10.04 output FPS, but voxel
+sampling retained only 100 million; this is not all-event inference. Two final
+30-second camera GUI runs (mostly about 5 MB/s RAW) delivered 10.07–10.09 FPS
+with no gaps observed by the RAW monitor, adapter or TCP receiver. Sustained
+high-event-rate real-camera end-to-end behavior still needs separate validation.
 
 This first hardware adapter does not apply camera rectification. Expect domain
 shift from DSEC until an NRV calibration and fine-tuning data are available.

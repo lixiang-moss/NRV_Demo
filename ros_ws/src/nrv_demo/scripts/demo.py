@@ -97,6 +97,7 @@ def process_raw_packet(packet):
 class NrvPythonDemo:
     def __init__(self):
         self.decode_events = rospy.get_param("~decode_events", True)
+        self.run_algorithm = rospy.get_param("~run_algorithm", True)
         self.duration = float(rospy.get_param("~duration", 0.0))
         self.image_fps = float(rospy.get_param("~image_fps", 10.0))
         self.output_dir = Path(rospy.get_param("~output_dir"))
@@ -117,16 +118,18 @@ class NrvPythonDemo:
         self.subscribers = [rospy.Subscriber(
             rospy.get_param("~raw_topic", "/delta_driver/events"), EventPacket,
             self.on_raw, queue_size=100, buff_size=16 * 1024 * 1024)]
-        if self.decode_events:
-            self.publisher = rospy.Publisher("~image", Image, queue_size=1)
-            self.subscribers.extend([
-                rospy.Subscriber(rospy.get_param("~events_topic", "/dvs/events"),
-                                 EventArray, self.on_events, queue_size=10,
-                                 buff_size=64 * 1024 * 1024),
-                rospy.Subscriber(rospy.get_param("~rendered_topic", "/delta_renderer/image"),
-                                 Image, self.on_rendered, queue_size=1,
-                                 buff_size=16 * 1024 * 1024),
-            ])
+        self.receive_events = self.decode_events and (self.run_algorithm or self.bridge is not None)
+        if self.receive_events:
+            self.subscribers.append(rospy.Subscriber(
+                rospy.get_param("~events_topic", "/dvs/events"),
+                EventArray, self.on_events, queue_size=10,
+                buff_size=64 * 1024 * 1024))
+            if self.run_algorithm:
+                self.publisher = rospy.Publisher("~image", Image, queue_size=1)
+                self.subscribers.append(rospy.Subscriber(
+                    rospy.get_param("~rendered_topic", "/delta_renderer/image"),
+                    Image, self.on_rendered, queue_size=1,
+                    buff_size=16 * 1024 * 1024))
 
     def on_raw(self, packet):
         byte_count = process_raw_packet(packet)  # Replace this function for a RAW algorithm.
@@ -152,16 +155,17 @@ class NrvPythonDemo:
             timestamp_ns = np.fromiter((e.ts.to_nsec() for e in message.events), dtype=np.uint64, count=count)
             self.bridge.submit(message.width, message.height, x, y, timestamp_ns, on)
         with self.lock:
-            if self.canvas is None:
-                self.canvas = np.zeros((message.height, message.width, 3), dtype=np.uint8)
-            # ON = green, OFF = blue, stored in OpenCV BGR order.
-            self.canvas[y[~on], x[~on]] = (255, 100, 40)
-            self.canvas[y[on], x[on]] = (80, 220, 80)
-            # Simple algorithm: centroid of ALL events in this display window.
-            self.window_count += count
-            self.window_x += int(x.sum())
-            self.window_y += int(y.sum())
-            self.window_on += int(on.sum())
+            if self.run_algorithm:
+                if self.canvas is None:
+                    self.canvas = np.zeros((message.height, message.width, 3), dtype=np.uint8)
+                # ON = green, OFF = blue, stored in OpenCV BGR order.
+                self.canvas[y[~on], x[~on]] = (255, 100, 40)
+                self.canvas[y[on], x[on]] = (80, 220, 80)
+                # Simple algorithm: centroid of ALL events in this display window.
+                self.window_count += count
+                self.window_x += int(x.sum())
+                self.window_y += int(y.sum())
+                self.window_on += int(on.sum())
             self.stats["event_batches"] += 1
             self.stats["decoded_events"] += count
             self.event_stamp = message.header.stamp
@@ -210,7 +214,7 @@ class NrvPythonDemo:
 
     def run(self):
         rospy.loginfo("NRV Python demo: RAW receiver active; decoded algorithm=%s; duration=%s s (0=Ctrl+C)",
-                      self.decode_events, self.duration)
+                      self.receive_events and self.run_algorithm, self.duration)
         next_log = self.started
         previous_bytes = previous_events = 0
         previous_log = self.started
@@ -218,7 +222,7 @@ class NrvPythonDemo:
             now = time.monotonic()
             if self.duration > 0 and now - self.started >= self.duration:
                 break
-            if self.decode_events:
+            if self.receive_events and self.run_algorithm:
                 self.publish_algorithm_image()
             if now >= next_log:
                 with self.lock:
@@ -242,10 +246,11 @@ class NrvPythonDemo:
             last_output = self.last_output
         checks = dict(raw_received=result["raw_packets"] > 0 and result["raw_bytes"] > 0,
                       raw_sequence_contiguous=result["raw_sequence_gaps"] == 0)
-        if self.decode_events:
-            checks.update(events_received=result["decoded_events"] > 0,
-                          renderer_received=result["rendered_images"] > 0,
-                          algorithm_published=result["algorithm_images"] > 0)
+        if self.receive_events:
+            checks["events_received"] = result["decoded_events"] > 0
+            if self.run_algorithm:
+                checks.update(renderer_received=result["rendered_images"] > 0,
+                              algorithm_published=result["algorithm_images"] > 0)
         if self.bridge is not None:
             result.update(bridge_sent_batches=self.bridge.sent_batches,
                           bridge_dropped_batches=self.bridge.dropped_batches,
