@@ -20,7 +20,7 @@ cd NRV_Demo
 
 The first run automatically builds `nrv-demo:noetic`. To build it separately, run `./scripts/build.sh`.
 
-The default is one GUI with camera controls and two side-by-side images:
+The default is an English GUI with two side-by-side images. Camera and noise controls are hidden initially; click **Settings** in the top bar to show them, and click it again to hide them. Hiding the panel keeps the current parameters active.
 
 - **Left** `/delta_renderer/image`: official original rendering.
 - **Right** `/nrv_python_demo/image`: retained events and their yellow centroid marker.
@@ -29,7 +29,7 @@ Move an object in front of the camera. Green pixels represent ON events and blue
 
 ## Adjusting noise in the GUI
 
-1. Start with the filters unchecked and observe a stationary scene, then move an object.
+1. Click **Settings** to open the parameter panel. Start with the filters unchecked and observe a stationary scene, then move an object.
 2. Enable **Neighbour support** to remove isolated events. Start at **5 ms**: an event needs a different pixel in its 3×3 neighbourhood active within this preceding time window. A shorter window is stricter. The first event of an isolated cluster is discarded; incoming events provide support even when discarded.
 3. Enable **Pixel interval**, initially **1 ms**, to suppress repeated events at a pixel. A longer interval suppresses more events, including potentially useful fast motion. The interval is measured from the last retained event, independently of polarity.
 4. Software edits take effect during acquisition. Both filters are off by default. The right view shows the filtered centroid; the status bar shows input events/s, cumulative retained percentage since the current capture started, and RAW sequence gaps. Filter history resets when settings change.

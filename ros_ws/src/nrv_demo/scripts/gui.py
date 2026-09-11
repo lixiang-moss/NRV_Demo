@@ -18,7 +18,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets as Q
 class NoiseWindow(Q.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('NRV Demo — Camera & Noise Controls / 相机与降噪')
+        self.setWindowTitle('NRV Demo — Camera & Noise Controls')
         self.resize(1420, 820)
         self.lock = threading.Lock()
         self.frames = {}
@@ -39,21 +39,28 @@ class NoiseWindow(Q.QMainWindow):
         self.setCentralWidget(root)
         layout = Q.QVBoxLayout(root)
         bar = Q.QHBoxLayout()
-        self.start_button = Q.QPushButton('Start / 开始采集')
-        self.stop_button = Q.QPushButton('Stop / 停止')
+        self.start_button = Q.QPushButton('Start')
+        self.stop_button = Q.QPushButton('Stop')
         self.start_button.clicked.connect(self.start)
         self.stop_button.clicked.connect(self.stop)
-        self.state = Q.QLabel('Stopped / 已停止')
+        self.state = Q.QLabel('Stopped')
         for widget in (self.start_button, self.stop_button, self.state):
             bar.addWidget(widget)
         bar.addStretch()
+        self.settings_button = Q.QPushButton('Settings')
+        self.settings_button.setCheckable(True)
+        self.settings_button.setToolTip('Show or hide camera and noise parameters')
+        bar.addWidget(self.settings_button)
         layout.addLayout(bar)
         body = Q.QHBoxLayout()
         layout.addLayout(body, 1)
         controls = Q.QWidget()
+        self.settings_panel = controls
+        controls.hide()
+        self.settings_button.toggled.connect(controls.setVisible)
         controls.setMaximumWidth(340)
         panel = Q.QVBoxLayout(controls)
-        hardware = Q.QGroupBox('Camera bias / 相机阈值寄存器')
+        hardware = Q.QGroupBox('Camera bias')
         form = Q.QFormLayout(hardware)
         self.bias = {}
         for address, label in [('0167', 'ON (0x0167)'), ('0168', 'OFF (0x0168)')]:
@@ -61,42 +68,42 @@ class NoiseWindow(Q.QMainWindow):
             control = Q.QSpinBox()
             control.setRange(0, 63)
             control.setValue(value & 63)
-            control.setToolTip('Decimal register code, not physical threshold. 数值增大不代表降噪增强。')
+            control.setToolTip('Decimal register code, not a physical threshold. A higher code does not necessarily reduce noise.')
             self.bias[address] = control
             form.addRow(label, control)
-        note = Q.QLabel('Register codes (decimal). Change one step at a time.\n寄存器十进制值，每次调一档；方向需对照画面。')
+        note = Q.QLabel('Register codes (decimal). Change one step at a time and compare the images.')
         note.setWordWrap(True)
         form.addRow(note)
-        apply_button = Q.QPushButton('Apply && restart / 应用并重启采集')
+        apply_button = Q.QPushButton('Apply && restart')
         apply_button.clicked.connect(self.apply_bias)
         form.addRow(apply_button)
         panel.addWidget(hardware)
-        software = Q.QGroupBox('Live software filters / 实时软件降噪')
+        software = Q.QGroupBox('Live software filters')
         form = Q.QFormLayout(software)
-        self.background = Q.QCheckBox('Neighbour filter / 邻域去噪')
+        self.background = Q.QCheckBox('Neighbour filter')
         self.window = Q.QDoubleSpinBox()
         self.window.setRange(0.1, 100)
         self.window.setValue(5)
         self.window.setSuffix(' ms')
-        self.refractory = Q.QCheckBox('Pixel interval / 重复事件过滤')
+        self.refractory = Q.QCheckBox('Pixel interval filter')
         self.interval = Q.QDoubleSpinBox()
         self.interval.setRange(0.1, 100)
         self.interval.setValue(1)
         self.interval.setSuffix(' ms')
         form.addRow(self.background)
-        form.addRow('Window / 邻域窗口', self.window)
+        form.addRow('Neighbour window', self.window)
         form.addRow(self.refractory)
-        form.addRow('Interval / 最小间隔', self.interval)
+        form.addRow('Minimum interval', self.interval)
         for control in (self.background, self.refractory):
             control.toggled.connect(self.update_filters)
         for control in (self.window, self.interval):
             control.valueChanged.connect(self.update_filters)
-        note = Q.QLabel('Left: original. Right: filtered events + centroid.\n左侧原始，右侧过滤后质心。RAW 话题保持原样。')
+        note = Q.QLabel('Left: original. Right: filtered events + centroid.\nSoftware filters leave the RAW topic unchanged.')
         note.setWordWrap(True)
         form.addRow(note)
         panel.addWidget(software)
-        save = Q.QPushButton('Save profile / 保存参数')
-        load = Q.QPushButton('Load profile / 加载参数')
+        save = Q.QPushButton('Save profile')
+        load = Q.QPushButton('Load profile')
         save.clicked.connect(self.save_profile)
         load.clicked.connect(self.load_profile)
         panel.addWidget(save)
@@ -104,10 +111,10 @@ class NoiseWindow(Q.QMainWindow):
         panel.addStretch()
         body.addWidget(controls)
         self.views = {}
-        for key, title in [('raw', 'Original rendering / 原始渲染'), ('algorithm', 'Filtered + centroid / 降噪与算法结果')]:
+        for key, title in [('raw', 'Original rendering'), ('algorithm', 'Filtered + centroid')]:
             column = Q.QVBoxLayout()
             column.addWidget(Q.QLabel(title))
-            view = Q.QLabel('Waiting for camera data / 等待相机数据')
+            view = Q.QLabel('Waiting for camera data')
             view.setAlignment(QtCore.Qt.AlignCenter)
             view.setMinimumSize(320, 240)
             view.setStyleSheet('background:#111827;color:#cbd5e1;border:1px solid #334155;')
@@ -162,10 +169,10 @@ class NoiseWindow(Q.QMainWindow):
             self.last_frame = 0
         for view in self.views.values():
             view.clear()
-            view.setText('Waiting for camera data / 等待相机数据')
+            view.setText('Waiting for camera data')
         self.metrics.setText('Events/s: —   Retained: —   RAW gaps: —')
         self.process.start('roslaunch', args)
-        self.state.setText('Starting / 正在启动')
+        self.state.setText('Starting')
         self.start_button.setEnabled(False)
 
     def stop(self):
@@ -175,7 +182,7 @@ class NoiseWindow(Q.QMainWindow):
     def interrupt(self):
         if self.process.state() == QtCore.QProcess.Running:
             self.stopping = True
-            self.state.setText('Stopping / 正在停止')
+            self.state.setText('Stopping')
             os.kill(int(self.process.processId()), signal.SIGINT)
 
     def apply_bias(self):
@@ -186,7 +193,7 @@ class NoiseWindow(Q.QMainWindow):
             self.interrupt()
 
     def finished(self, *_):
-        self.state.setText('Stopped / 已停止')
+        self.state.setText('Stopped')
         self.start_button.setEnabled(True)
         if self.restart_pending and not self.closing:
             self.restart_pending = False
@@ -229,12 +236,12 @@ class NoiseWindow(Q.QMainWindow):
             view.setPixmap(QtGui.QPixmap.fromImage(image).scaled(view.size(), QtCore.Qt.KeepAspectRatio,
                                                                 QtCore.Qt.SmoothTransformation))
         if self.process.state() == QtCore.QProcess.Running and not self.stopping:
-            self.state.setText('Streaming / 采集中' if last and time.monotonic() - last < 2 else
-                               'Waiting for data / 等待数据（检查相机和下方日志）')
+            self.state.setText('Streaming' if last and time.monotonic() - last < 2 else
+                               'Waiting for data (check the camera and log below)')
         if status:
             total = status['decoded_events']
             retained = 100 * status['filtered_events'] / total if total else 0
-            self.metrics.setText('Events/s: {:,.0f}   Retained / 累计保留: {:.1f}%   RAW gaps: {}'.format(
+            self.metrics.setText('Events/s: {:,.0f}   Retained (session): {:.1f}%   RAW gaps: {}'.format(
                 status['events_per_second'], retained, status['raw_sequence_gaps']))
 
     def save_profile(self):
@@ -256,7 +263,7 @@ class NoiseWindow(Q.QMainWindow):
                 self.refractory.setChecked(filters['refractory'])
                 self.interval.setValue(filters['interval_ms'])
                 self.update_filters()
-                self.log.appendPlainText('Profile loaded. Click Apply & restart for camera bias. / 相机参数需点击应用。')
+                self.log.appendPlainText('Profile loaded. Click Apply & restart for camera bias.')
             except (OSError, ValueError, KeyError, TypeError) as error:
                 Q.QMessageBox.warning(self, 'Cannot load profile', str(error))
 
