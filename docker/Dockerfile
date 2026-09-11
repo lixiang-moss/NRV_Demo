@@ -37,8 +37,11 @@ RUN source /opt/ros/noetic/setup.bash \
     && cd /opt/nrv_demo_ws \
     && catkin_make -DCMAKE_BUILD_TYPE=Release -DCATKIN_ENABLE_TESTING=OFF -j2
 
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pyqt5 fonts-wqy-zenhei \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 WORKDIR /workspace
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["roslaunch", "nrv_demo", "demo.launch"]
+CMD ["roslaunch", "nrv_demo", "gui.launch"]

@@ -18,9 +18,13 @@ fi
 
 echo "Output: ${run_dir}"
 echo 'Move an object in front of the camera. Ctrl+C stops the demo and writes the summary.'
+launch_file=demo.launch
+if [ "${SHOW_GUI}" = true ] && [ "${DECODE_EVENTS}" = true ]; then
+  launch_file=gui.launch
+fi
 launch_status=0
 docker compose -f "${project_dir}/compose.yaml" run --rm nrv-demo \
-  roslaunch nrv_demo demo.launch \
+  roslaunch nrv_demo "${launch_file}" \
   "serial_number:=${CAMERA_SERIAL:-}" "device_index:=${CAMERA_INDEX:-0}" \
   "show_gui:=${SHOW_GUI}" "decode_events:=${DECODE_EVENTS}" \
   "duration:=${DURATION:-0}" "output_dir:=/output/$(basename "${run_dir}")" \

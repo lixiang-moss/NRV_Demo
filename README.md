@@ -8,7 +8,7 @@ This repository contains only the two ROS packages, container configuration, and
 
 ## Quick start
 
-Host requirements: Linux x86_64, Docker Engine, Docker Compose v2, and Python 3. The two image windows also require X11 or XWayland, `DISPLAY`, and `xhost` (the `x11-xserver-utils` package on Ubuntu). ROS and algorithm dependencies run inside the container.
+Host requirements: Linux x86_64, Docker Engine, Docker Compose v2, and Python 3. The GUI requires X11 or XWayland, `DISPLAY`, and `xhost` (the `x11-xserver-utils` package on Ubuntu). ROS and algorithm dependencies run inside the container.
 
 Connect the NRV DELTA01 and stop any Viewer, jAER, or other capture application using the same camera.
 
@@ -20,19 +20,33 @@ cd NRV_Demo
 
 The first run automatically builds `nrv-demo:noetic`. To build it separately, run `./scripts/build.sh`.
 
-By default, two `rqt_image_view` windows open. Identify them using the topic selector in each window:
+The default is one GUI with camera controls and two side-by-side images:
 
-- **Input view** `/delta_renderer/image`: the official renderer's event image.
-- **Algorithm view** `/nrv_python_demo/image`: a Python-generated event image with a yellow activity-centroid cross, event count, and coordinates.
+- **Left** `/delta_renderer/image`: official original rendering.
+- **Right** `/nrv_python_demo/image`: retained events and their yellow centroid marker.
 
-Place the windows side by side and move your hand or an object in front of the camera. Green pixels represent ON events; blue pixels represent OFF events. The algorithm averages all event coordinates in the current display window to demonstrate integration. It is not an object detector: background activity and camera motion also affect the centroid. No centroid is drawn when the window contains no events.
+Move an object in front of the camera. Green pixels represent ON events and blue pixels OFF events in the Python view. The centroid is a simple integration example, not object detection.
 
-Press **Ctrl+C** to stop. Results are saved to `output/run_*/summary.json`, with the final algorithm image in `algorithm_last.png` in the same directory.
+## Adjusting noise in the GUI
+
+1. Start with the filters unchecked and observe a stationary scene, then move an object.
+2. Enable **Neighbour support** to remove isolated events. Start at **5 ms**: an event needs a different pixel in its 3×3 neighbourhood active within this preceding time window. A shorter window is stricter. The first event of an isolated cluster is discarded; incoming events provide support even when discarded.
+3. Enable **Pixel interval**, initially **1 ms**, to suppress repeated events at a pixel. A longer interval suppresses more events, including potentially useful fast motion. The interval is measured from the last retained event, independently of polarity.
+4. Software edits take effect during acquisition. Both filters are off by default. The right view shows the filtered centroid; the status bar shows input events/s, cumulative retained percentage since the current capture started, and RAW sequence gaps. Filter history resets when settings change.
+5. Adjust **ON / OFF** by one register step, then click **Apply & restart**. The GUI writes `sensor_settings.txt` under the current output directory and restarts driver, decoder, renderer, and Python together. Other sensor settings are preserved. Compare noise and moving edges after every change.
+
+ON/OFF controls are **decimal low-six-bit register codes**, 0–63, at `0x0167` / `0x0168`; they are not calibrated sensitivity values. A larger code is not labelled as stronger noise reduction. The loaded sensor file determines the coarse/reference settings, which the GUI preserves. See the [jAER NRV register mapping](https://github.com/SensorsINI/jaer/blob/master/src/nrv/README.md).
+
+**Save profile / Load profile** stores ON/OFF codes and software settings as JSON. Loading applies software settings immediately; click **Apply & restart** for hardware changes. Hardware changes affect newly captured RAW events; software filters never modify `/delta_driver/events` or `/dvs/events`. The sample Python algorithm uses a small native filter helper for event-by-event processing.
+
+**Stop** ends acquisition while keeping the window open; **Start** begins again. Close the GUI or press **Ctrl+C** to exit. Results are in `output/run_*/summary.json` and `algorithm_last.png`; restarting within the same window replaces these with the latest capture's results. A timed GUI run stops acquisition and leaves the window open for inspection.
+
+After updating an existing checkout, rebuild once with `./scripts/build.sh` before launching.
 
 ## Common commands
 
 ```bash
-# Show both views for 20 seconds, then exit automatically
+# Capture for 20 seconds; keep the GUI open for inspection
 DURATION=20 ./scripts/run.sh
 
 # Headless: keep RAW, decoding, and both image topics; disable viewer windows
@@ -68,12 +82,14 @@ flowchart TD
     end
     Driver -->|RAW bytes and metadata| Python[nrv_python_demo · Python process]
     Adapter -->|/dvs/events · EventArray| Python
-    Renderer -->|/delta_renderer/image| InputView[nrv_input_view · Input window]
+    Renderer -->|/delta_renderer/image| GUI[nrv_gui · Controls and two views]
     Renderer -->|Received image count| Python
-    Python -->|/nrv_python_demo/image| OutputView[nrv_algorithm_view · Algorithm window]
+    Python -->|/nrv_python_demo/image| GUI
+    GUI -->|/nrv_noise parameters| Python
+    GUI -. Apply and restart .-> Manager
 ```
 
-`roslaunch` starts `roscore` when needed. The driver, adapter, and renderer share a nodelet manager; Python and the two viewers run as separate processes.
+`roslaunch` starts `roscore` when needed. The driver, adapter, and renderer share a nodelet manager; Python and the GUI run as separate processes. The GUI owns a child roslaunch for the capture pipeline; its own ROS master remains available during restarts.
 
 | Topic | ROS message | Content |
 | --- | --- | --- |

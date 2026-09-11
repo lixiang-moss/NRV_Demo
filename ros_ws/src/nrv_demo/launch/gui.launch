@@ -1,0 +1,21 @@
+<launch>
+  <arg name="serial_number" default="" />
+  <arg name="device_index" default="0" />
+  <arg name="sensor_setting_path" default="/opt/ros/noetic/share/delta_driver/config/sensor/Delta_01_1000FPS.txt" />
+  <arg name="decode_events" default="true" />
+  <arg name="show_gui" default="true" />
+  <arg name="duration" default="0" />
+  <arg name="output_dir" default="/output/manual" />
+  <arg name="message_threshold_time_ms" default="10" />
+  <arg name="image_fps" default="10" />
+
+  <node name="nrv_gui" pkg="nrv_demo" type="gui.py" required="true" output="screen">
+    <param name="serial_number" type="str" value="$(arg serial_number)" />
+    <param name="device_index" type="str" value="$(arg device_index)" />
+    <param name="sensor_setting_path" type="str" value="$(arg sensor_setting_path)" />
+    <param name="duration" type="str" value="$(arg duration)" />
+    <param name="output_dir" type="str" value="$(arg output_dir)" />
+    <param name="message_threshold_time_ms" type="str" value="$(arg message_threshold_time_ms)" />
+    <param name="image_fps" type="str" value="$(arg image_fps)" />
+  </node>
+</launch>

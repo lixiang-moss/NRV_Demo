@@ -20,19 +20,33 @@ cd NRV_Demo
 
 第一次会自动构建镜像 `nrv-demo:noetic`。也可以先执行 `./scripts/build.sh` 单独构建。
 
-默认打开两个 `rqt_image_view` 窗口，通过各窗口的 topic 选择框区分：
+默认打开一个 GUI，包含参数面板及左右两幅画面：
 
-- **输入画面** `/delta_renderer/image`：官方 renderer 的事件图。
-- **算法画面** `/nrv_python_demo/image`：Python 生成的事件图，带黄色活动重心十字、事件数量和坐标。
+- **左侧** `/delta_renderer/image`：官方原始事件渲染。
+- **右侧** `/nrv_python_demo/image`：降噪后的事件和黄色质心标记。
 
-把两窗口并排放置，在镜头前移动手或物体，观察处理结果。绿色表示 ON 事件，蓝色表示 OFF 事件。算法是当前显示窗口内所有事件坐标的平均值，用于验证接入，不是目标检测；背景活动和相机自身移动也会影响重心。无事件时不绘制重心。
+在镜头前移动物体，观察处理结果。Python 画面中绿色表示 ON，蓝色表示 OFF。质心仅用于演示算法接入，不是目标检测。
 
-按 **Ctrl+C** 停止，结果保存在 `output/run_*/summary.json`，最后的算法图保存在同目录 `algorithm_last.png`。
+## 在 GUI 中调整噪声
+
+1. 先保持两个软件过滤器关闭，分别观察静止场景和移动物体。
+2. 勾选 **Neighbour support / 去孤立噪点**，从 **5 ms** 开始。事件的 3×3 邻域中，必须有其他像素在此前的时间窗口内触发；窗口越短，过滤越严格。孤立事件簇的第一个事件会被丢弃；被丢弃的输入事件仍可为后续邻居提供支持。
+3. 勾选 **Pixel interval / 抑制同像素重复事件**，从 **1 ms** 开始。间隔越长，抑制越强，也可能丢掉快速运动。间隔从该像素上次保留的事件起计算，不区分极性。
+4. 软件参数在采集中实时生效，默认均关闭。右侧展示过滤后的质心；底部显示输入事件速率、本次采集的累计保留比例及 RAW 序号间断数。修改过滤参数会清空过滤器历史。
+5. **ON / OFF** 每次调整一个数值步长，再点击 **Apply & restart / 应用并重启采集**。GUI 将配置写入当前输出目录的 `sensor_settings.txt`，并一起重启驱动、解码器、渲染器和 Python，其他传感器配置保持不变。每次调整后对比背景噪点与运动边缘。
+
+ON/OFF 是 `0x0167` / `0x0168` 的**低 6 位十进制寄存器值**，范围 0–63，不是标定后的灵敏度。数值增大不代表降噪一定增强。粗调与参考路径设置继承加载的传感器文件，GUI 不修改它们。寄存器映射参考 [jAER 的 NRV 实现](https://github.com/SensorsINI/jaer/blob/master/src/nrv/README.md)。
+
+**保存参数 / 加载参数**使用 JSON 保存 ON/OFF 和软件设置。加载后软件设置立即生效，相机参数需点击“应用并重启”。相机参数会影响此后采集的 RAW；软件过滤不修改 `/delta_driver/events` 或 `/dvs/events`。Python 示例通过一个小型原生计算模块逐事件执行过滤。
+
+**停止**结束采集并保留窗口，**开始采集**可再次启动。关闭 GUI 或按 **Ctrl+C** 退出。结果保存在 `output/run_*/summary.json` 和 `algorithm_last.png`；同一窗口内重新采集会用最新一轮结果覆盖这两个文件。定时 GUI 采集结束后窗口保留，方便查看。
+
+已有项目更新后，先执行一次 `./scripts/build.sh` 重建镜像，再启动。
 
 ## 常用命令
 
 ```bash
-# 双画面运行 20 秒后自动退出
+# 采集 20 秒后停止，GUI 保留供查看
 DURATION=20 ./scripts/run.sh
 
 # 无桌面：保留 RAW、解码、两路图像消息，关闭查看窗口
@@ -68,12 +82,14 @@ flowchart TD
     end
     Driver -->|RAW 字节及元数据| Python[nrv_python_demo · Python 进程]
     Adapter -->|/dvs/events · EventArray| Python
-    Renderer -->|/delta_renderer/image| InputView[nrv_input_view · 输入窗口]
+    Renderer -->|/delta_renderer/image| GUI[nrv_gui · 参数与双画面]
     Renderer -->|图像接收计数| Python
-    Python -->|/nrv_python_demo/image| OutputView[nrv_algorithm_view · 算法窗口]
+    Python -->|/nrv_python_demo/image| GUI
+    GUI -->|/nrv_noise 参数| Python
+    GUI -. 应用并重启 .-> Manager
 ```
 
-`roslaunch` 在需要时自动启动 `roscore`。驱动、适配器、renderer 在同一 nodelet manager 内；Python 和两个查看器是独立进程。
+`roslaunch` 在需要时自动启动 `roscore`。驱动、适配器、renderer 在同一 nodelet manager 内；Python 和 GUI 是独立进程。GUI 管理子 roslaunch 的整条采集流程，重启采集时主 ROS master 保持运行。
 
 | Topic | ROS 消息 | 内容 |
 | --- | --- | --- |
