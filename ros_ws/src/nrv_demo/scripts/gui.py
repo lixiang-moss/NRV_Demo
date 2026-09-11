@@ -92,7 +92,7 @@ class NoiseWindow(Q.QMainWindow):
         form.addRow('Neighbour window', self.window)
         form.addRow(self.refractory)
         form.addRow('Minimum interval', self.interval)
-        note = Q.QLabel('Left: original. Right: filtered events + centroid.\nSoftware filters leave the RAW topic unchanged.')
+        note = Q.QLabel('Both views use the same denoised event stream.\nThe original RAW topic is preserved.')
         note.setWordWrap(True)
         form.addRow(note)
         panel.addWidget(software)
@@ -111,7 +111,7 @@ class NoiseWindow(Q.QMainWindow):
         panel.addStretch()
         body.addWidget(controls)
         self.views = {}
-        for key, title in [('raw', 'Original rendering'), ('algorithm', 'Filtered + centroid')]:
+        for key, title in [('raw', 'Denoised rendering'), ('algorithm', 'Filtered + centroid')]:
             column = Q.QVBoxLayout()
             column.addWidget(Q.QLabel(title))
             view = Q.QLabel('Waiting for camera data')
@@ -271,8 +271,8 @@ class NoiseWindow(Q.QMainWindow):
             self.state.setText('Streaming' if last and time.monotonic() - last < 2 else
                                'Waiting for data (check the camera and log below)')
         if status:
-            total = status['decoded_events']
-            retained = 100 * status['filtered_events'] / total if total else 0
+            total = status['noise_input_events']
+            retained = 100 * status['noise_retained_events'] / total if total else 0
             self.metrics.setText('Events/s: {:,.0f}   Retained (session): {:.1f}%   RAW gaps: {}'.format(
                 status['events_per_second'], retained, status['raw_sequence_gaps']))
 

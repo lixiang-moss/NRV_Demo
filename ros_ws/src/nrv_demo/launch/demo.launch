@@ -23,17 +23,19 @@
   </node>
 
   <group if="$(arg decode_events)">
+    <node name="nrv_noise_filter" pkg="nodelet" type="nodelet"
+          args="load nrv_demo/RawNoiseNodelet /delta_manager" output="screen" />
     <group ns="dvs">
       <node name="event_adapter" pkg="nodelet" type="nodelet"
             args="load nrv_demo/DvsAdapterNodelet /delta_manager" output="screen">
-        <param name="input_topic" value="/delta_driver/events" />
+        <param name="input_topic" value="/nrv_noise_filter/events" />
         <param name="output_topic" value="events" />
         <param name="camera_info_topic" value="camera_info" />
       </node>
     </group>
     <node name="delta_renderer" pkg="nodelet" type="nodelet"
           args="load delta_tools/RendererNodelet /delta_manager" output="screen">
-      <param name="topic" value="/delta_driver/events" />
+      <param name="topic" value="/nrv_noise_filter/events" />
       <param name="image_fps" value="$(arg image_fps)" />
       <param name="subscriber_queue_size" value="1" />
     </node>

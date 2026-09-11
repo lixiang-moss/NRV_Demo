@@ -129,10 +129,8 @@ class DvsAdapterNodelet : public nodelet::Nodelet {
     decoder->setTimeMultiplier(1000U);
     while (decoder->decode(*packet, &processor_)) {
     }
-    if (!message_.events.empty()) {
-      message_.header.stamp = message_.events.back().ts;
-      publisher_.publish(message_);
-    }
+    message_.header.stamp = message_.events.empty() ? packet_stamp_ : message_.events.back().ts;
+    publisher_.publish(message_);
     width_ = packet->width;
     height_ = packet->height;
     ++packets_;

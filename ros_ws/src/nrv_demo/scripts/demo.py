@@ -12,8 +12,7 @@ import rospy
 from dvs_msgs.msg import EventArray
 from event_camera_msgs.msg import EventPacket
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
-from noise_filter import NoiseFilter
+from std_msgs.msg import String, UInt64MultiArray
 
 
 def process_raw_packet(packet):
@@ -39,10 +38,8 @@ class NrvPythonDemo:
         self.stats = dict(raw_packets=0, raw_bytes=0, raw_sequence_gaps=0,
                           event_batches=0, decoded_events=0, rendered_images=0,
                           algorithm_images=0, encoding=None, width=0, height=0)
-        self.filter = NoiseFilter()
-        self.filter_config = dict(background=False, window_ms=5.0, refractory=False, interval_ms=1.0)
         self.status_pub = rospy.Publisher("~status", String, queue_size=1)
-        self.stats["filtered_events"] = 0
+        self.stats.update(filtered_events=0, noise_input_events=0, noise_retained_events=0)
         self.last_seq = None
         self.canvas = None
         self.last_output = None
@@ -55,6 +52,7 @@ class NrvPythonDemo:
         if self.decode_events:
             self.publisher = rospy.Publisher("~image", Image, queue_size=1)
             self.subscribers.extend([
+                rospy.Subscriber("/nrv_noise_filter/counts", UInt64MultiArray, self.on_noise_counts, queue_size=1),
                 rospy.Subscriber(rospy.get_param("~events_topic", "/dvs/events"),
                                  EventArray, self.on_events, queue_size=10,
                                  buff_size=64 * 1024 * 1024),
@@ -78,14 +76,9 @@ class NrvPythonDemo:
     def on_events(self, message):
         """Example algorithm input: every event has x, y, ts and polarity."""
         count = len(message.events)
-        if not count:
-            return
         x = np.fromiter((e.x for e in message.events), dtype=np.intp, count=count)
         y = np.fromiter((e.y for e in message.events), dtype=np.intp, count=count)
         on = np.fromiter((e.polarity for e in message.events), dtype=bool, count=count)
-        timestamps = np.fromiter((e.ts.to_sec() for e in message.events), dtype=float, count=count)
-        keep = self.filter.apply(x, y, timestamps, (message.height, message.width), self.filter_config)
-        x, y, on = x[keep], y[keep], on[keep]
         with self.lock:
             self.stats["decoded_events"] += count
             count = len(x)
@@ -103,6 +96,10 @@ class NrvPythonDemo:
             self.stats["event_batches"] += 1
             self.event_stamp = message.header.stamp
             self.frame_id = message.header.frame_id
+
+    def on_noise_counts(self, message):
+        with self.lock:
+            self.stats["noise_input_events"], self.stats["noise_retained_events"] = message.data
 
     def on_rendered(self, _message):
         with self.lock:
@@ -153,7 +150,6 @@ class NrvPythonDemo:
         previous_log = self.started
         while not rospy.is_shutdown():
             now = time.monotonic()
-            self.filter_config = rospy.get_param("/nrv_noise", self.filter_config)
             if self.duration > 0 and now - self.started >= self.duration:
                 break
             if self.decode_events:
@@ -166,11 +162,11 @@ class NrvPythonDemo:
                               stats["raw_packets"], stats["raw_bytes"],
                               (stats["raw_bytes"] - previous_bytes) / elapsed / 1e6,
                               stats["raw_sequence_gaps"], stats["decoded_events"],
-                              (stats["decoded_events"] - previous_events) / elapsed,
+                              (stats["noise_input_events"] - previous_events) / elapsed,
                               stats["rendered_images"], stats["algorithm_images"])
-                stats["events_per_second"] = (stats["decoded_events"] - previous_events) / elapsed
+                stats["events_per_second"] = (stats["noise_input_events"] - previous_events) / elapsed
                 self.status_pub.publish(String(data=json.dumps(stats)))
-                previous_bytes, previous_events = stats["raw_bytes"], stats["decoded_events"]
+                previous_bytes, previous_events = stats["raw_bytes"], stats["noise_input_events"]
                 previous_log, next_log = now, now + 1.0
             time.sleep(1.0 / self.image_fps)
         for subscriber in self.subscribers:
@@ -181,7 +177,7 @@ class NrvPythonDemo:
         checks = dict(raw_received=result["raw_packets"] > 0 and result["raw_bytes"] > 0,
                       raw_sequence_contiguous=result["raw_sequence_gaps"] == 0)
         if self.decode_events:
-            checks.update(events_received=result["decoded_events"] > 0,
+            checks.update(events_received=result["event_batches"] > 0,
                           renderer_received=result["rendered_images"] > 0,
                           algorithm_published=result["algorithm_images"] > 0)
         result.update(status="PASS" if all(checks.values()) else "FAIL", checks=checks,

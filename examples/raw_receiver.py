@@ -17,6 +17,6 @@ def on_raw(msg):
 
 if __name__ == "__main__":
     rospy.init_node("partner_raw_receiver")
-    subscriber = rospy.Subscriber("/delta_driver/events", EventPacket, on_raw,
+    subscriber = rospy.Subscriber(rospy.get_param("~topic", "/delta_driver/events"), EventPacket, on_raw,
                                   queue_size=100, buff_size=16 * 1024 * 1024)
     rospy.spin()

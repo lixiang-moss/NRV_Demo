@@ -22,7 +22,7 @@ cd NRV_Demo
 
 默认打开全英文 GUI，展示左右两幅画面。调参面板默认隐藏；点击顶部 **Settings** 展开，再次点击收起。隐藏面板不会改变当前参数或停止过滤。
 
-- **左侧** `/delta_renderer/image`：官方原始事件渲染。
+- **左侧** `/delta_renderer/image`：官方渲染器生成的降噪事件画面。
 - **右侧** `/nrv_python_demo/image`：降噪后的事件和黄色质心标记。
 
 在镜头前移动物体，观察处理结果。Python 画面中绿色表示 ON，蓝色表示 OFF。质心仅用于演示算法接入，不是目标检测。
@@ -32,12 +32,12 @@ cd NRV_Demo
 1. 点击 **Settings** 打开调参面板。先保持两个软件过滤器关闭，分别观察静止场景和移动物体。
 2. 勾选 **Neighbour filter / 去孤立噪点**，从 **5 ms** 开始。事件的 3×3 邻域中，必须有其他像素在此前的时间窗口内触发；窗口越短，过滤越严格。孤立事件簇的第一个事件会被丢弃；被丢弃的输入事件仍可为后续邻居提供支持。
 3. 勾选 **Pixel interval / 抑制同像素重复事件**，从 **1 ms** 开始。间隔越长，抑制越强，也可能丢掉快速运动。间隔从该像素上次保留的事件起计算，不区分极性。
-4. 修改参数后统一点击 **Apply parameters** 才生效；仅修改软件参数时无需重启采集，默认均关闭。右侧展示过滤后的质心；底部显示输入事件速率、本次采集的累计保留比例及 RAW 序号间断数。应用新的过滤参数会清空过滤器历史。
+4. 修改参数后统一点击 **Apply parameters** 才生效；仅修改软件参数时无需重启采集，默认均关闭。两路画面使用同一份降噪事件，右侧额外展示质心；底部显示输入事件速率、本次采集的累计保留比例及 RAW 序号间断数。应用新的过滤参数会清空过滤器历史。
 5. **ON / OFF** 每次调整一个数值步长，再点击 **Apply parameters**。GUI 将配置写入当前输出目录的 `sensor_settings.txt`，并一起重启驱动、解码器、渲染器和 Python，其他传感器配置保持不变。每次调整后对比背景噪点与运动边缘。
 
 ON/OFF 是 `0x0167` / `0x0168` 的**低 6 位十进制寄存器值**，范围 0–63，不是标定后的灵敏度。数值增大不代表降噪一定增强。粗调与参考路径设置继承加载的传感器文件，GUI 不修改它们。寄存器映射参考 [jAER 的 NRV 实现](https://github.com/SensorsINI/jaer/blob/master/src/nrv/README.md)。
 
-**保存参数 / 加载参数**使用 JSON 保存 ON/OFF 和软件设置。加载只填入控件，点击 **Apply parameters** 后统一生效；修改了相机参数时会自动重启采集。开始采集使用上次已应用的设置。相机参数会影响此后采集的 RAW；软件过滤不修改 `/delta_driver/events` 或 `/dvs/events`。Python 示例通过一个小型原生计算模块逐事件执行过滤。
+**保存参数 / 加载参数**使用 JSON 保存 ON/OFF 和软件设置。加载只填入控件，点击 **Apply parameters** 后统一生效；修改了相机参数时会自动重启采集。开始采集使用上次已应用的设置。相机参数会影响此后采集的 RAW；C++ 前置过滤节点保留 `/delta_driver/events` 原始数据，将降噪后的编码事件发布到 `/nrv_noise_filter/events`。官方 renderer 和 `/dvs/events` 适配器共同订阅该话题，Python 接收已经降噪的事件，不再二次过滤。
 
 每次点击 **Apply parameters**，都会自动将已应用的 ON/OFF 和软件参数保存到 `output/last_applied_parameters.json`。下次打开自动恢复，容器重启后同样保留；尚未点击应用的修改不会被记住。
 
@@ -79,37 +79,43 @@ flowchart TD
       Driver[delta_driver · 官方 DriverNodelet]
       Adapter[dvs/event_adapter · 本项目适配器]
       Renderer[delta_renderer · 官方 RendererNodelet]
-      Driver -->|/delta_driver/events · EventPacket| Adapter
-      Driver -->|/delta_driver/events · EventPacket| Renderer
+      Driver -->|/delta_driver/events · group_aer| Filter[nrv_noise_filter · Event denoising]
+      Filter -->|/nrv_noise_filter/events · mono| Adapter
+      Filter -->|/nrv_noise_filter/events · mono| Renderer
     end
     Driver -->|RAW 字节及元数据| Python[nrv_python_demo · Python 进程]
     Adapter -->|/dvs/events · EventArray| Python
     Renderer -->|/delta_renderer/image| GUI[nrv_gui · 参数与双画面]
     Renderer -->|图像接收计数| Python
     Python -->|/nrv_python_demo/image| GUI
-    GUI -->|/nrv_noise 参数| Python
+    GUI -->|/nrv_noise 参数| Filter
     GUI -. 应用并重启 .-> Manager
 ```
 
-`roslaunch` 在需要时自动启动 `roscore`。驱动、适配器、renderer 在同一 nodelet manager 内；Python 和 GUI 是独立进程。GUI 管理子 roslaunch 的整条采集流程，重启采集时主 ROS master 保持运行。
+`roslaunch` 在需要时自动启动 `roscore`。驱动、降噪节点、适配器、renderer 在同一 nodelet manager 内；Python 和 GUI 是独立进程。GUI 管理子 roslaunch 的整条采集流程，重启采集时主 ROS master 保持运行。
 
 | Topic | ROS 消息 | 内容 |
 | --- | --- | --- |
 | `/delta_driver/events` | `event_camera_msgs/EventPacket` | 官方 RAW 编码载荷、序号、编码方式、时间信息、宽高 |
-| `/dvs/events` | `dvs_msgs/EventArray` | 解码后的 `(x, y, ts, polarity)` 事件数组 |
+| `/nrv_noise_filter/events` | `event_camera_msgs/EventPacket` | 降噪后的亮度变化事件，`mono` 编码、纳秒传感器时间，独立包序号 |
+| `/dvs/events` | `dvs_msgs/EventArray` | 降噪后的 `(x, y, ts, polarity)` 事件数组 |
 | `/dvs/camera_info` | `sensor_msgs/CameraInfo` | 相机信息；本示例未提供标定参数，重心算法无需标定 |
 | `/delta_renderer/image` | `sensor_msgs/Image` | 官方渲染画面 |
 | `/nrv_python_demo/image` | `sensor_msgs/Image`，`bgr8` | Python 算法画面 |
+
+降噪后的话题使用 SDK 支持的 `mono` 编码（每个保留事件 8 字节），不是相机原始线缆格式。接收程序需读取 `encoding` 和 `time_base`，不能硬编码为 `group_aer`；事件数量减少并不保证编码字节数减少。`/dvs/events` 现在也是降噪后的事件。关闭两个过滤器会保留全部解码出的亮度变化事件；RAW-only 模式不启动此过滤及渲染分支。
 
 两幅画面各自累积事件，显示时间窗不严格同步。默认图像目标频率为 10 Hz；RAW 订阅不会因为显示频率而抽样。
 
 ## 对方算法如何接收 RAW
 
-运行演示后，在仓库目录下打开另一个终端：
+运行演示后，在仓库目录下打开另一个终端，接收与两路画面相同的降噪编码事件：
 
 ```bash
-docker compose run --rm nrv-demo python3 /examples/raw_receiver.py
+docker compose run --rm nrv-demo python3 /examples/raw_receiver.py _topic:=/nrv_noise_filter/events
 ```
+
+省略 `_topic:=/nrv_noise_filter/events` 则接收原始 `/delta_driver/events` 数据流。
 
 [examples/raw_receiver.py](examples/raw_receiver.py) 是可直接改写的最小 Python 接收节点，核心接口是：
 
@@ -120,7 +126,7 @@ def on_raw(msg):
     payload = memoryview(msg.events)
     # 在这里调用对方算法，传入 payload 和所需元数据。
 
-subscriber = rospy.Subscriber("/delta_driver/events", EventPacket, on_raw,
+subscriber = rospy.Subscriber("/nrv_noise_filter/events", EventPacket, on_raw,
                               queue_size=100, buff_size=16 * 1024 * 1024)
 ```
 
@@ -140,7 +146,7 @@ subscriber = rospy.Subscriber("/delta_driver/events", EventPacket, on_raw,
 
 1. Python 收到非空 RAW 载荷。
 2. 从接收到的第一个 RAW 包起，`seq` 连续。
-3. Python 收到解码事件和官方 renderer 图像。
+3. Python 收到解码事件批次（过滤后可以为空）和官方 renderer 图像。
 4. Python 已发布算法图像。
 
 RAW-only 模式只检查前两项。`summary.json` 保存具体计数和各项检查；脚本按结果返回 `PASS=0`、`FAIL=1`。有时长限制时，Python 正常结束会触发 launch 整组退出，ROS 的 `REQUIRED process ... has died! / process has finished cleanly` 是这种收尾机制的提示。

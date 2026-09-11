@@ -2,4 +2,7 @@
   <class name="nrv_demo/DvsAdapterNodelet" type="nrv_demo::DvsAdapterNodelet" base_class_type="nodelet::Nodelet">
     <description>EventPacket to dvs_msgs/EventArray adapter.</description>
   </class>
+  <class name="nrv_demo/RawNoiseNodelet" type="nrv_demo::RawNoiseNodelet" base_class_type="nodelet::Nodelet">
+    <description>Filter RAW input events and publish mono packets for rendering and algorithms.</description>
+  </class>
 </library>

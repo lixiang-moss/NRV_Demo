@@ -22,7 +22,7 @@ The first run automatically builds `nrv-demo:noetic`. To build it separately, ru
 
 The default is an English GUI with two side-by-side images. Camera and noise controls are hidden initially; click **Settings** in the top bar to show them, and click it again to hide them. Hiding the panel keeps the current parameters active.
 
-- **Left** `/delta_renderer/image`: official original rendering.
+- **Left** `/delta_renderer/image`: official rendering of the denoised event stream.
 - **Right** `/nrv_python_demo/image`: retained events and their yellow centroid marker.
 
 Move an object in front of the camera. Green pixels represent ON events and blue pixels OFF events in the Python view. The centroid is a simple integration example, not object detection.
@@ -32,12 +32,12 @@ Move an object in front of the camera. Green pixels represent ON events and blue
 1. Click **Settings** to open the parameter panel. Start with the filters unchecked and observe a stationary scene, then move an object.
 2. Enable **Neighbour filter** to remove isolated events. Start at **5 ms**: an event needs a different pixel in its 3×3 neighbourhood active within this preceding time window. A shorter window is stricter. The first event of an isolated cluster is discarded; incoming events provide support even when discarded.
 3. Enable **Pixel interval**, initially **1 ms**, to suppress repeated events at a pixel. A longer interval suppresses more events, including potentially useful fast motion. The interval is measured from the last retained event, independently of polarity.
-4. Edits are staged until you click **Apply parameters**. Software-only changes apply during acquisition without restarting. Both filters are off by default. The right view shows the filtered centroid; the status bar shows input events/s, cumulative retained percentage since the current capture started, and RAW sequence gaps. Filter history resets when changed settings are applied.
+4. Edits are staged until you click **Apply parameters**. Software-only changes apply during acquisition without restarting. Both filters are off by default. Both views consume the same denoised event stream; the right view adds the centroid; the status bar shows input events/s, cumulative retained percentage since the current capture started, and RAW sequence gaps. Filter history resets when changed settings are applied.
 5. Adjust **ON / OFF** by one register step, then click **Apply parameters**. The GUI writes `sensor_settings.txt` under the current output directory and restarts driver, decoder, renderer, and Python together. Other sensor settings are preserved. Compare noise and moving edges after every change.
 
 ON/OFF controls are **decimal low-six-bit register codes**, 0–63, at `0x0167` / `0x0168`; they are not calibrated sensitivity values. A larger code is not labelled as stronger noise reduction. The loaded sensor file determines the coarse/reference settings, which the GUI preserves. See the [jAER NRV register mapping](https://github.com/SensorsINI/jaer/blob/master/src/nrv/README.md).
 
-**Save profile / Load profile** stores ON/OFF codes and software settings as JSON. Loading fills the controls without changing active settings; click **Apply parameters** to apply all loaded settings. Start uses the last applied settings. Hardware changes affect newly captured RAW events; software filters never modify `/delta_driver/events` or `/dvs/events`. The sample Python algorithm uses a small native filter helper for event-by-event processing.
+**Save profile / Load profile** stores ON/OFF codes and software settings as JSON. Loading fills the controls without changing active settings; click **Apply parameters** to apply all loaded settings. Start uses the last applied settings. Hardware changes affect newly captured RAW events; the C++ RAW-ingress filter preserves `/delta_driver/events` and publishes denoised packets on `/nrv_noise_filter/events`. The official renderer and the `/dvs/events` adapter both subscribe to these packets. Python receives already-filtered events and does not filter them again.
 
 Every click on **Apply parameters** also saves the applied ON/OFF and software settings to `output/last_applied_parameters.json`. The next launch restores these automatically, including across container restarts. Unapplied edits are not remembered.
 
@@ -79,37 +79,43 @@ flowchart TD
       Driver[delta_driver · Official DriverNodelet]
       Adapter[dvs/event_adapter · Demo adapter]
       Renderer[delta_renderer · Official RendererNodelet]
-      Driver -->|/delta_driver/events · EventPacket| Adapter
-      Driver -->|/delta_driver/events · EventPacket| Renderer
+      Driver -->|/delta_driver/events · group_aer| Filter[nrv_noise_filter · Event denoising]
+      Filter -->|/nrv_noise_filter/events · mono| Adapter
+      Filter -->|/nrv_noise_filter/events · mono| Renderer
     end
     Driver -->|RAW bytes and metadata| Python[nrv_python_demo · Python process]
     Adapter -->|/dvs/events · EventArray| Python
     Renderer -->|/delta_renderer/image| GUI[nrv_gui · Controls and two views]
     Renderer -->|Received image count| Python
     Python -->|/nrv_python_demo/image| GUI
-    GUI -->|/nrv_noise parameters| Python
+    GUI -->|/nrv_noise parameters| Filter
     GUI -. Apply and restart .-> Manager
 ```
 
-`roslaunch` starts `roscore` when needed. The driver, adapter, and renderer share a nodelet manager; Python and the GUI run as separate processes. The GUI owns a child roslaunch for the capture pipeline; its own ROS master remains available during restarts.
+`roslaunch` starts `roscore` when needed. The driver, filter, adapter, and renderer share a nodelet manager; Python and the GUI run as separate processes. The GUI owns a child roslaunch for the capture pipeline; its own ROS master remains available during restarts.
 
 | Topic | ROS message | Content |
 | --- | --- | --- |
 | `/delta_driver/events` | `event_camera_msgs/EventPacket` | Official RAW encoded payload, sequence number, encoding, timing metadata, width, and height |
-| `/dvs/events` | `dvs_msgs/EventArray` | Decoded `(x, y, ts, polarity)` event arrays |
+| `/nrv_noise_filter/events` | `event_camera_msgs/EventPacket` | Denoised CD events, `mono` encoding, sensor time in nanoseconds, independent packet sequence |
+| `/dvs/events` | `dvs_msgs/EventArray` | Denoised `(x, y, ts, polarity)` event arrays |
 | `/dvs/camera_info` | `sensor_msgs/CameraInfo` | Camera information; no calibration parameters are supplied, and the centroid algorithm does not require them |
 | `/delta_renderer/image` | `sensor_msgs/Image` | Official rendered image |
 | `/nrv_python_demo/image` | `sensor_msgs/Image`, `bgr8` | Python algorithm image |
 
-The two image paths accumulate events independently, so their display windows are not strictly synchronized. The default target image rate is 10 Hz; the RAW subscription does not subsample events based on the display rate.
+The denoised topic uses the SDK-compatible `mono` encoding (8 bytes per retained CD event), not the original camera wire format. Read `encoding` and `time_base` rather than assuming `group_aer`; filtering may increase encoded byte size despite reducing event count. `/dvs/events` now contains denoised events. Both filters disabled preserves all decoded CD events. RAW-only mode bypasses this entire filtering/rendering branch.
+
+When every event is rejected, empty batches keep both image paths updating without a stale centroid. The two image paths accumulate events independently, so their display windows are not strictly synchronized. The default target image rate is 10 Hz; the RAW subscription does not subsample events based on the display rate.
 
 ## Receiving RAW data in your algorithm
 
-With the demo running, open another terminal in the repository directory:
+With the demo running, receive the same denoised encoded stream used by both views:
 
 ```bash
-docker compose run --rm nrv-demo python3 /examples/raw_receiver.py
+docker compose run --rm nrv-demo python3 /examples/raw_receiver.py _topic:=/nrv_noise_filter/events
 ```
+
+Omit `_topic:=/nrv_noise_filter/events` to receive the original `/delta_driver/events` stream instead.
 
 [examples/raw_receiver.py](examples/raw_receiver.py) is a minimal Python receiver you can modify directly. Its core interface is:
 
@@ -120,7 +126,7 @@ def on_raw(msg):
     payload = memoryview(msg.events)
     # Call your algorithm here with the payload and required metadata.
 
-subscriber = rospy.Subscriber("/delta_driver/events", EventPacket, on_raw,
+subscriber = rospy.Subscriber("/nrv_noise_filter/events", EventPacket, on_raw,
                               queue_size=100, buff_size=16 * 1024 * 1024)
 ```
 
@@ -140,7 +146,7 @@ A final `PASS` in dual-view mode requires:
 
 1. Python received a nonempty RAW payload.
 2. RAW `seq` values remained consecutive from the first received packet.
-3. Python received decoded events and official renderer images.
+3. Python received decoded event batches (possibly empty after filtering) and official renderer images.
 4. Python published algorithm images.
 
 RAW-only mode checks only the first two conditions. `summary.json` records the counts and individual checks. The script returns `0` for `PASS` and `1` for `FAIL`. In a timed run, the Python node's normal exit shuts down the launch group. The ROS message `REQUIRED process ... has died! / process has finished cleanly` reflects this shutdown mechanism.
