@@ -8,6 +8,8 @@
   <arg name="output_dir" default="/output/manual" />
   <arg name="message_threshold_time_ms" default="10" />
   <arg name="image_fps" default="10" />
+  <arg name="bridge_host" default="127.0.0.1" />
+  <arg name="bridge_port" default="0" />
 
   <node name="delta_manager" pkg="nodelet" type="nodelet" args="manager" required="true" output="screen" />
   <node name="delta_driver" pkg="nodelet" type="nodelet"
@@ -48,5 +50,7 @@
     <param name="duration" value="$(arg duration)" />
     <param name="image_fps" value="$(arg image_fps)" />
     <param name="output_dir" value="$(arg output_dir)" />
+    <param name="bridge_host" value="$(arg bridge_host)" />
+    <param name="bridge_port" value="$(arg bridge_port)" />
   </node>
 </launch>

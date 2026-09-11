@@ -22,3 +22,4 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix
       - ./output:/output
       - ./examples:/examples:ro
+      - ./ros_ws/src/nrv_demo:/opt/nrv_demo_ws/src/nrv_demo:ro

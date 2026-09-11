@@ -3,6 +3,9 @@
 
 import json
 from pathlib import Path
+import queue
+import socket
+import struct
 import threading
 import time
 
@@ -12,6 +15,72 @@ import rospy
 from dvs_msgs.msg import EventArray
 from event_camera_msgs.msg import EventPacket
 from sensor_msgs.msg import Image
+
+
+EVENT_DTYPE = np.dtype([
+    ("x", "<u2"), ("y", "<u2"), ("timestamp_ns", "<u8"), ("polarity", "u1")
+])
+BRIDGE_HEADER = struct.Struct("!4sIIII")
+
+
+class EventTcpSender:
+    """Non-blocking latest-batch bridge from ROS to the host GPU process."""
+
+    def __init__(self, host, port):
+        self.host, self.port = host, port
+        self.queue = queue.Queue(maxsize=2)
+        self.stopping = threading.Event()
+        self.sent_batches = self.dropped_batches = self.reconnects = 0
+        self.sequence = 0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def submit(self, width, height, x, y, timestamp_ns, polarity):
+        events = np.empty(len(x), dtype=EVENT_DTYPE)
+        events["x"], events["y"] = x, y
+        events["timestamp_ns"], events["polarity"] = timestamp_ns, polarity
+        item = (width, height, events, self.sequence)
+        self.sequence = (self.sequence + 1) % (1 << 32)
+        try:
+            self.queue.put_nowait(item)
+        except queue.Full:
+            self.queue.get_nowait()  # Keep latency bounded by discarding the oldest batch.
+            self.queue.put_nowait(item)
+            self.dropped_batches += 1
+
+    def _run(self):
+        connection = None
+        while not self.stopping.is_set():
+            try:
+                item = self.queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if connection is None:
+                try:
+                    connection = socket.create_connection((self.host, self.port), timeout=1.0)
+                    connection.settimeout(1.0)
+                    self.reconnects += 1
+                except OSError:
+                    self.dropped_batches += 1
+                    time.sleep(0.2)
+                    continue
+            width, height, events, sequence = item
+            try:
+                connection.sendall(BRIDGE_HEADER.pack(
+                    b"NRV1", width, height, len(events), sequence
+                ))
+                connection.sendall(memoryview(events).cast("B"))
+                self.sent_batches += 1
+            except OSError:
+                connection.close()
+                connection = None
+                self.dropped_batches += 1
+        if connection is not None:
+            connection.close()
+
+    def close(self):
+        self.stopping.set()
+        self.thread.join(timeout=2.0)
 
 
 def process_raw_packet(packet):
@@ -42,6 +111,8 @@ class NrvPythonDemo:
         self.last_output = None
         self.frame_id = ""
         self.event_stamp = rospy.Time()
+        bridge_port = int(rospy.get_param("~bridge_port", 0))
+        self.bridge = EventTcpSender(rospy.get_param("~bridge_host", "127.0.0.1"), bridge_port) if bridge_port else None
         self.window_count = self.window_x = self.window_y = self.window_on = 0
         self.subscribers = [rospy.Subscriber(
             rospy.get_param("~raw_topic", "/delta_driver/events"), EventPacket,
@@ -77,6 +148,9 @@ class NrvPythonDemo:
         x = np.fromiter((e.x for e in message.events), dtype=np.intp, count=count)
         y = np.fromiter((e.y for e in message.events), dtype=np.intp, count=count)
         on = np.fromiter((e.polarity for e in message.events), dtype=bool, count=count)
+        if self.bridge is not None:
+            timestamp_ns = np.fromiter((e.ts.to_nsec() for e in message.events), dtype=np.uint64, count=count)
+            self.bridge.submit(message.width, message.height, x, y, timestamp_ns, on)
         with self.lock:
             if self.canvas is None:
                 self.canvas = np.zeros((message.height, message.width, 3), dtype=np.uint8)
@@ -161,6 +235,8 @@ class NrvPythonDemo:
             time.sleep(1.0 / self.image_fps)
         for subscriber in self.subscribers:
             subscriber.unregister()
+        if self.bridge is not None:
+            self.bridge.close()
         with self.lock:
             result = dict(self.stats)
             last_output = self.last_output
@@ -170,6 +246,11 @@ class NrvPythonDemo:
             checks.update(events_received=result["decoded_events"] > 0,
                           renderer_received=result["rendered_images"] > 0,
                           algorithm_published=result["algorithm_images"] > 0)
+        if self.bridge is not None:
+            result.update(bridge_sent_batches=self.bridge.sent_batches,
+                          bridge_dropped_batches=self.bridge.dropped_batches,
+                          bridge_connections=self.bridge.reconnects)
+            checks["event_bridge_sent"] = self.bridge.sent_batches > 0
         result.update(status="PASS" if all(checks.values()) else "FAIL", checks=checks,
                       elapsed_seconds=round(time.monotonic() - self.started, 3),
                       decode_events=self.decode_events)

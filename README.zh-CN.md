@@ -52,6 +52,34 @@ CAMERA_INDEX=1 ./scripts/run.sh
 ./scripts/build.sh
 ```
 
+## 实时 E2FAI 图像与光流
+
+`run_e2fai.sh` 保留 Docker 中的 NRV ROS 驱动和解码器，在宿主机 GPU 上
+运行模型。窗口同步显示三列：白底 events、E2FAI 加循环 image residual、
+原始带 pooling 的 E2FAI flow。
+
+需要现有的 `learning_everything` 项目、`e2fai_pp` Conda 环境、E2FAI
+backbone 和 epoch-43 image-residual checkpoint；本机默认路径已经写入脚本：
+
+```bash
+./scripts/run_e2fai.sh
+
+# 选择另一张物理 GPU，并录制显示结果
+GPU=1 RECORD=true ./scripts/run_e2fai.sh
+
+# 无窗口运行（仍保存 summary.json 和最后一帧）
+HEADLESS=true DURATION=30 ./scripts/run_e2fai.sh
+```
+
+文件移动后可通过 `LEARNING_EVERYTHING_ROOT`、`PYTHON`、
+`IMAGE_CHECKPOINT`、`BACKBONE_CHECKPOINT` 覆盖默认路径。结果写入
+`output/e2fai_*`。默认输入为不重叠的 100 ms、15-bin、720×960 voxel；
+可用 `WINDOW_MS=...` 修改时间窗。DELTA01 事件直接使用原生 960×720 分辨率，
+不 crop、也不 resize；flow 单位是每个时间窗内的原生传感器像素。
+
+当前相机适配不做相机矫正；在获得 NRV 标定和微调数据前，相对 DSEC 会存在
+domain shift。
+
 USB 通过 `/dev/bus/usb` 和 USB 设备 cgroup 规则提供给容器。脚本临时授予 root 容器 X11 访问权，退出后撤销。ROS 使用 host 网络，默认只面向本机；先停止同名的其他 ROS 演示。
 
 ## 流程和节点
@@ -135,15 +163,15 @@ RAW-only 模式只检查前两项。`summary.json` 保存具体计数和各项�
 | RAW 有数据、解码事件少或为零 | 在镜头前制造运动，查看适配器日志和 RAW 编码方式 |
 | RAW 序号跳变 | 检查驱动/接收端负载，先用 RAW-only 模式复测；避免在回调中大量打印或阻塞 I/O |
 | 图像计数增长但窗口不显示 | 在桌面终端检查 `DISPLAY`、`xhost`；无桌面使用 `SHOW_GUI=false` |
-| 改了包内算法却没变化 | 执行 `./scripts/build.sh` 重建镜像；`examples/` 脚本则无需重建 |
+| 改了包内算法却没变化 | 重启演示；ROS 包源码和 `examples/` 都从宿主机挂载 |
 
 ## 内容与依赖
 
 ```text
 compose.yaml                         容器运行配置
 docker/                              独立镜像和入口
-scripts/build.sh, scripts/run.sh      构建、一键运行
-examples/raw_receiver.py              对方算法接入最小示例
+scripts/build.sh, scripts/run*.sh     构建和一键运行入口
+examples/*.py                         RAW 接收和 E2FAI 实时推理
 ros_ws/src/nrv_demo/                  Python 示例、适配器、完整 launch
 ros_ws/src/dvs_msgs/                  Event / EventArray 消息及原始许可证
 output/                              本地运行结果，不进入 Git 或构建上下文

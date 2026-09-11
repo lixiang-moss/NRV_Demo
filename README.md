@@ -52,6 +52,37 @@ CAMERA_INDEX=1 ./scripts/run.sh
 ./scripts/build.sh
 ```
 
+## Real-time E2FAI image and flow
+
+`run_e2fai.sh` keeps the NRV ROS driver/decoder in Docker and runs the GPU model
+on the host. It displays a synchronized three-panel view: white-background
+events, E2FAI plus the recurrent image residual, and the original pooled E2FAI
+flow.
+
+Requirements are the existing `learning_everything` checkout, its
+`e2fai_pp` Conda environment, the E2FAI backbone checkpoint, and the epoch-43
+image-residual checkpoint. The defaults point to their paths on this machine:
+
+```bash
+./scripts/run_e2fai.sh
+
+# Select another physical GPU; optionally record the displayed stream
+GPU=1 RECORD=true ./scripts/run_e2fai.sh
+
+# No display (still saves summary.json and the final frame)
+HEADLESS=true DURATION=30 ./scripts/run_e2fai.sh
+```
+
+Override moved files with `LEARNING_EVERYTHING_ROOT`, `PYTHON`,
+`IMAGE_CHECKPOINT`, or `BACKBONE_CHECKPOINT`. Results are written below
+`output/e2fai_*`. The default input is a non-overlapping 100 ms, 15-bin,
+720×960 voxel; `WINDOW_MS=...` changes the window. DELTA01 events are processed
+at their native 960×720 resolution without crop or resize. Flow is measured in
+native sensor pixels per window.
+
+This first hardware adapter does not apply camera rectification. Expect domain
+shift from DSEC until an NRV calibration and fine-tuning data are available.
+
 USB access uses `/dev/bus/usb` and a USB device cgroup rule. The script temporarily grants the root container X11 access and revokes it on exit. ROS uses host networking with localhost defaults; stop other ROS demos using the same node names before starting.
 
 ## Data flow and nodes
@@ -135,15 +166,15 @@ These checks establish connectivity. Consecutive packet numbers do not prove tha
 | RAW arrives but decoded events are scarce or absent | Create motion in front of the lens; inspect adapter logs and the RAW encoding |
 | RAW sequence discontinuities | Check driver/receiver load and retry in RAW-only mode; avoid excessive logging or blocking I/O in callbacks |
 | Image counts increase but no windows appear | Check `DISPLAY` and `xhost` in a desktop terminal; use `SHOW_GUI=false` without a desktop |
-| Package algorithm changes have no effect | Rebuild with `./scripts/build.sh`; scripts under `examples/` do not require rebuilding |
+| Package algorithm changes have no effect | Restart the demo; the package source and `examples/` are mounted from the host |
 
 ## Contents and dependencies
 
 ```text
 compose.yaml                         Container runtime configuration
 docker/                              Standalone image and entrypoint
-scripts/build.sh, scripts/run.sh      Build and one-command launch
-examples/raw_receiver.py              Minimal algorithm integration example
+scripts/build.sh, scripts/run*.sh     Build and one-command launchers
+examples/*.py                         RAW receiver and E2FAI real-time inference
 ros_ws/src/nrv_demo/                  Python demo, adapter, and complete launch
 ros_ws/src/dvs_msgs/                  Event / EventArray messages and original license
 output/                              Local results; excluded from Git and build context
