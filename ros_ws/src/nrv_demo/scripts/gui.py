@@ -29,6 +29,7 @@ class NoiseWindow(Q.QMainWindow):
         self.stopping = False
         self.output = Path(rospy.get_param('~output_dir'))
         self.output.mkdir(parents=True, exist_ok=True)
+        self.profile_path = Path(rospy.get_param('~profile_path', '/output/last_applied_parameters.json'))
         self.sensor_text = Path(rospy.get_param('~sensor_setting_path')).read_text()
         self.process = QtCore.QProcess(self)
         self.process.setProcessChannelMode(QtCore.QProcess.MergedChannels)
@@ -74,11 +75,8 @@ class NoiseWindow(Q.QMainWindow):
         note = Q.QLabel('Register codes (decimal). Change one step at a time and compare the images.')
         note.setWordWrap(True)
         form.addRow(note)
-        apply_button = Q.QPushButton('Apply && restart')
-        apply_button.clicked.connect(self.apply_bias)
-        form.addRow(apply_button)
         panel.addWidget(hardware)
-        software = Q.QGroupBox('Live software filters')
+        software = Q.QGroupBox('Software filters')
         form = Q.QFormLayout(software)
         self.background = Q.QCheckBox('Neighbour filter')
         self.window = Q.QDoubleSpinBox()
@@ -94,14 +92,16 @@ class NoiseWindow(Q.QMainWindow):
         form.addRow('Neighbour window', self.window)
         form.addRow(self.refractory)
         form.addRow('Minimum interval', self.interval)
-        for control in (self.background, self.refractory):
-            control.toggled.connect(self.update_filters)
-        for control in (self.window, self.interval):
-            control.valueChanged.connect(self.update_filters)
         note = Q.QLabel('Left: original. Right: filtered events + centroid.\nSoftware filters leave the RAW topic unchanged.')
         note.setWordWrap(True)
         form.addRow(note)
         panel.addWidget(software)
+        self.apply_button = Q.QPushButton('Apply parameters')
+        self.apply_button.setToolTip('Apply all edits. Camera bias changes restart acquisition.')
+        self.apply_button.clicked.connect(self.apply_parameters)
+        self.parameter_status = Q.QLabel('Parameters applied')
+        panel.addWidget(self.apply_button)
+        panel.addWidget(self.parameter_status)
         save = Q.QPushButton('Save profile')
         load = Q.QPushButton('Load profile')
         save.clicked.connect(self.save_profile)
@@ -133,23 +133,46 @@ class NoiseWindow(Q.QMainWindow):
             rospy.Subscriber('/nrv_python_demo/image', Image, self.on_image, callback_args='algorithm', queue_size=1),
             rospy.Subscriber('/nrv_python_demo/status', String, self.on_status, queue_size=1),
         ]
+        if self.profile_path.exists():
+            try:
+                self.set_profile(json.loads(self.profile_path.read_text()))
+                self.log.appendPlainText('Restored last applied parameters.')
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                self.log.appendPlainText('Could not restore saved parameters: ' + str(error))
+        self.active_bias = self.bias_values()
+        self.active_filters = self.filter_values()
+        for control in (self.background, self.refractory):
+            control.toggled.connect(self.update_pending)
+        for control in (self.window, self.interval, *self.bias.values()):
+            control.valueChanged.connect(self.update_pending)
+        self.update_pending()
         self.update_filters()
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(100)
         QtCore.QTimer.singleShot(0, self.start)
 
+    def bias_values(self):
+        return {address: widget.value() for address, widget in self.bias.items()}
+
+    def filter_values(self):
+        return dict(background=self.background.isChecked(), window_ms=self.window.value(),
+                    refractory=self.refractory.isChecked(), interval_ms=self.interval.value())
+
+    def update_pending(self):
+        pending = self.bias_values() != self.active_bias or self.filter_values() != self.active_filters
+        self.apply_button.setEnabled(pending)
+        self.parameter_status.setText('Pending changes — click Apply parameters' if pending else 'Parameters applied')
+        self.parameter_status.setWordWrap(True)
+
     def update_filters(self):
-        rospy.set_param('/nrv_noise', dict(background=self.background.isChecked(),
-                        window_ms=self.window.value(), refractory=self.refractory.isChecked(),
-                        interval_ms=self.interval.value()))
+        rospy.set_param('/nrv_noise', self.active_filters)
 
     def write_settings(self):
         text = self.sensor_text
-        for address, widget in self.bias.items():
+        for address, value in self.active_bias.items():
             # Change only the threshold's low six bits; keep the source setting's other bits.
             pattern = r'(20:' + address + r'=)([0-9a-fA-F]+)'
-            value = widget.value()
             text = re.sub(pattern, lambda m: m[1] + format((int(m[2], 16) & ~63) | value, '02X'), text, flags=re.I)
         path = self.output / 'sensor_settings.txt'
         path.write_text(text)
@@ -185,12 +208,21 @@ class NoiseWindow(Q.QMainWindow):
             self.state.setText('Stopping')
             os.kill(int(self.process.processId()), signal.SIGINT)
 
-    def apply_bias(self):
-        if self.process.state() == QtCore.QProcess.NotRunning:
-            self.start()
-        else:
+    def apply_parameters(self):
+        bias_changed = self.bias_values() != self.active_bias
+        self.active_bias = self.bias_values()
+        self.active_filters = self.filter_values()
+        self.update_filters()
+        self.write_settings()
+        self.profile_path.parent.mkdir(parents=True, exist_ok=True)
+        self.profile_path.write_text(json.dumps(dict(bias=self.active_bias, filters=self.active_filters), indent=2) + '\n')
+        self.update_pending()
+        if bias_changed and self.process.state() != QtCore.QProcess.NotRunning:
+            self.log.appendPlainText('Applying camera parameters: restarting acquisition.')
             self.restart_pending = True
             self.interrupt()
+        else:
+            self.log.appendPlainText('Parameters applied.')
 
     def finished(self, *_):
         self.state.setText('Stopped')
@@ -248,22 +280,25 @@ class NoiseWindow(Q.QMainWindow):
         path, _ = Q.QFileDialog.getSaveFileName(self, 'Save profile', str(self.output / 'noise_profile.json'), 'JSON (*.json)')
         if path:
             Path(path).write_text(json.dumps(dict(bias={a: w.value() for a, w in self.bias.items()},
-                                               filters=rospy.get_param('/nrv_noise')), indent=2) + '\n')
+                                               filters=self.filter_values()), indent=2) + '\n')
+
+    def set_profile(self, config):
+        for address, widget in self.bias.items():
+            widget.setValue(config['bias'][address])
+        filters = config['filters']
+        self.background.setChecked(filters['background'])
+        self.window.setValue(filters['window_ms'])
+        self.refractory.setChecked(filters['refractory'])
+        self.interval.setValue(filters['interval_ms'])
 
     def load_profile(self):
         path, _ = Q.QFileDialog.getOpenFileName(self, 'Load profile', '/output', 'JSON (*.json)')
         if path:
             try:
                 config = json.loads(Path(path).read_text())
-                for address, widget in self.bias.items():
-                    widget.setValue(config['bias'][address])
-                filters = config['filters']
-                self.background.setChecked(filters['background'])
-                self.window.setValue(filters['window_ms'])
-                self.refractory.setChecked(filters['refractory'])
-                self.interval.setValue(filters['interval_ms'])
-                self.update_filters()
-                self.log.appendPlainText('Profile loaded. Click Apply & restart for camera bias.')
+                self.set_profile(config)
+                self.update_pending()
+                self.log.appendPlainText('Profile loaded. Click Apply parameters to apply the changes.')
             except (OSError, ValueError, KeyError, TypeError) as error:
                 Q.QMessageBox.warning(self, 'Cannot load profile', str(error))
 
