@@ -8,7 +8,12 @@ if ! docker image inspect nrv-demo:noetic >/dev/null 2>&1; then
   "${project_dir}/scripts/build.sh"
 fi
 mkdir -p "${project_dir}/output"
-run_dir="$(mktemp -d "${project_dir}/output/run_$(date +%Y%m%d_%H%M%S)_XXXXXX")"
+if [ -n "${RUN_DIR:-}" ]; then
+  run_dir="${RUN_DIR}"
+  mkdir -p "${run_dir}"
+else
+  run_dir="$(mktemp -d "${project_dir}/output/run_$(date +%Y%m%d_%H%M%S)_XXXXXX")"
+fi
 
 if [ "${SHOW_GUI}" = true ] && [ "${DECODE_EVENTS}" = true ]; then
   [ -n "${DISPLAY:-}" ] || { echo 'DISPLAY is empty. Set SHOW_GUI=false for a headless run.' >&2; exit 1; }
