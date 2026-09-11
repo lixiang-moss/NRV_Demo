@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>dvs_msgs</name>
+  <version>0.0.0</version>
+  <description>Minimal Event and EventArray interfaces from rpg_dvs_ros.</description>
+  <maintainer email="lixiang-moss@users.noreply.github.com">lixiang-moss</maintainer>
+  <author>Elias Mueggler</author>
+  <license>MIT</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>message_generation</build_depend>
+  <depend>std_msgs</depend>
+  <exec_depend>message_runtime</exec_depend>
+</package>

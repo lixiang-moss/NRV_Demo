@@ -1,0 +1,5 @@
+<library path="lib/libnrv_demo_nodelets">
+  <class name="nrv_demo/DvsAdapterNodelet" type="nrv_demo::DvsAdapterNodelet" base_class_type="nodelet::Nodelet">
+    <description>EventPacket to dvs_msgs/EventArray adapter.</description>
+  </class>
+</library>

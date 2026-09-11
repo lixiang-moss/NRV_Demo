@@ -1,0 +1,6 @@
+**
+!docker/
+!docker/**
+!ros_ws/
+!ros_ws/src/
+!ros_ws/src/**

@@ -1,0 +1,9 @@
+output/
+ros_ws/build/
+ros_ws/devel/
+ros_ws/install/
+__pycache__/
+*.pyc
+.env
+*.bag
+*.dvs
