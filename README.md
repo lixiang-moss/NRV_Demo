@@ -59,11 +59,15 @@ on the host. It displays a synchronized three-panel view: white-background
 events, E2FAI plus the recurrent image residual, and the original pooled E2FAI
 flow.
 
-Requirements are the existing `learning_everything` checkout, its
-`e2fai_pp` Conda environment, the E2FAI backbone checkpoint, and the epoch-43
-image-residual checkpoint. The defaults point to their paths on this machine:
+The minimal model runtime is bundled in this repository. Checkpoints are kept
+locally and ignored by Git. Put them either in the repository root using their
+original names (`e2fai_backbone.ckpt`, `epoch_043.pt`) or under `checkpoints/`
+as shown in the repository layout. Create the host GPU environment once, then
+run the demo:
 
 ```bash
+conda env create -f environment-e2fai.yml
+conda activate nrv-e2fai
 ./scripts/run_e2fai.sh
 
 # Select another physical GPU; optionally record the displayed stream
@@ -73,8 +77,8 @@ GPU=1 RECORD=true ./scripts/run_e2fai.sh
 HEADLESS=true DURATION=30 ./scripts/run_e2fai.sh
 ```
 
-Override moved files with `LEARNING_EVERYTHING_ROOT`, `PYTHON`,
-`IMAGE_CHECKPOINT`, or `BACKBONE_CHECKPOINT`. Results are written below
+Override the interpreter or weights with `PYTHON`, `IMAGE_CHECKPOINT`, or
+`BACKBONE_CHECKPOINT`. Results are written below
 `output/e2fai_*`. The default input is a non-overlapping 100 ms, 15-bin,
 720×960 voxel; `WINDOW_MS=...` changes the window. DELTA01 events are processed
 at their native 960×720 resolution without crop or resize. Flow is measured in
@@ -175,6 +179,9 @@ compose.yaml                         Container runtime configuration
 docker/                              Standalone image and entrypoint
 scripts/build.sh, scripts/run*.sh     Build and one-command launchers
 examples/*.py                         RAW receiver and E2FAI real-time inference
+runtime/nrv_e2fai/                    Minimal standalone inference model
+checkpoints/                          E2FAI backbone and epoch-43 image residual
+environment-e2fai.yml                Host GPU inference environment
 ros_ws/src/nrv_demo/                  Python demo, adapter, and complete launch
 ros_ws/src/dvs_msgs/                  Event / EventArray messages and original license
 output/                              Local results; excluded from Git and build context

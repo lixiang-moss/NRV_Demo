@@ -58,10 +58,34 @@ CAMERA_INDEX=1 ./scripts/run.sh
 运行模型。窗口同步显示三列：白底 events、E2FAI 加循环 image residual、
 原始带 pooling 的 E2FAI flow。
 
-需要现有的 `learning_everything` 项目、`e2fai_pp` Conda 环境、E2FAI
-backbone 和 epoch-43 image-residual checkpoint；本机默认路径已经写入脚本：
+最小模型代码已放在本项目中；checkpoint 保存在本机并由 Git 忽略。启动脚本
+支持下面任意一种布局：
+
+```text
+NRV_Demo/e2fai_backbone.ckpt
+NRV_Demo/epoch_043.pt
+```
+
+或者：
+
+```text
+NRV_Demo/checkpoints/e2fai_backbone.ckpt
+NRV_Demo/checkpoints/image_residual_epoch043.pt
+```
+
+第一次运行先创建宿主机 GPU 环境：
 
 ```bash
+cd NRV_Demo
+conda env create -f environment-e2fai.yml
+conda activate nrv-e2fai
+```
+
+以后更新代码和运行：
+
+```bash
+git pull
+conda activate nrv-e2fai
 ./scripts/run_e2fai.sh
 
 # 选择另一张物理 GPU，并录制显示结果
@@ -71,8 +95,8 @@ GPU=1 RECORD=true ./scripts/run_e2fai.sh
 HEADLESS=true DURATION=30 ./scripts/run_e2fai.sh
 ```
 
-文件移动后可通过 `LEARNING_EVERYTHING_ROOT`、`PYTHON`、
-`IMAGE_CHECKPOINT`、`BACKBONE_CHECKPOINT` 覆盖默认路径。结果写入
+可通过 `PYTHON`、`IMAGE_CHECKPOINT`、`BACKBONE_CHECKPOINT` 覆盖解释器或
+权重路径。结果写入
 `output/e2fai_*`。默认输入为不重叠的 100 ms、15-bin、720×960 voxel；
 可用 `WINDOW_MS=...` 修改时间窗。DELTA01 事件直接使用原生 960×720 分辨率，
 不 crop、也不 resize；flow 单位是每个时间窗内的原生传感器像素。
@@ -172,6 +196,9 @@ compose.yaml                         容器运行配置
 docker/                              独立镜像和入口
 scripts/build.sh, scripts/run*.sh     构建和一键运行入口
 examples/*.py                         RAW 接收和 E2FAI 实时推理
+runtime/nrv_e2fai/                    最小独立推理模型
+checkpoints/                          E2FAI backbone 和 epoch-43 image residual
+environment-e2fai.yml                宿主机 GPU 推理环境
 ros_ws/src/nrv_demo/                  Python 示例、适配器、完整 launch
 ros_ws/src/dvs_msgs/                  Event / EventArray 消息及原始许可证
 output/                              本地运行结果，不进入 Git 或构建上下文

@@ -15,8 +15,8 @@ import cv2
 import numpy as np
 import torch
 
-from learning_everything.inference import load_recurrent_model
-from learning_everything.visualization import event_polarity_rgb, flow_hsv_rgb
+from nrv_e2fai import load_recurrent_model
+from nrv_e2fai.visualization import event_polarity_rgb, flow_hsv_rgb
 
 
 EVENT_DTYPE = np.dtype([
@@ -186,7 +186,7 @@ def montage(
     events_rgb = event_polarity_rgb(voxel[:, None])[0, 0]
     log_image = output["log_image"][0, 0].detach().float().cpu().numpy()
     image_rgb = image_range.render(log_image)
-    flow_rgb = flow_hsv_rgb(output["flow"][:, None], flow_max_px)[0][0, 0]
+    flow_rgb = flow_hsv_rgb(output["flow"][:, None], flow_max_px)[0, 0]
     panels = [
         label(events_rgb, f"Events ({event_count:,} / window)"),
         label(image_rgb, "E2FAI + recurrent image residual"),

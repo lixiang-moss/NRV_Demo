@@ -2,18 +2,19 @@
 set -euo pipefail
 
 project_dir="$(cd "$(dirname "$0")/.." && pwd)"
-learning_root="${LEARNING_EVERYTHING_ROOT:-/home/shuang/codes/learning_everything}"
-python_bin="${PYTHON:-/home/shuang/miniconda3/envs/e2fai_pp/bin/python}"
-image_checkpoint="${IMAGE_CHECKPOINT:-/raid/shuang/learning_everything/learning_everything_reproduction/fresh_e2fai_seed42_rerun_20260824T172241Z/run/image/checkpoints/epoch_043.pt}"
-backbone="${BACKBONE_CHECKPOINT:-${learning_root}/checkpoints/e2fai_backbone.ckpt}"
+python_bin="${PYTHON:-python3}"
+image_checkpoint="${IMAGE_CHECKPOINT:-${project_dir}/checkpoints/image_residual_epoch043.pt}"
+backbone="${BACKBONE_CHECKPOINT:-${project_dir}/checkpoints/e2fai_backbone.ckpt}"
+[ -f "${image_checkpoint}" ] || image_checkpoint="${project_dir}/epoch_043.pt"
+[ -f "${backbone}" ] || backbone="${project_dir}/e2fai_backbone.ckpt"
 port="${PORT:-8765}"
 window_ms="${WINDOW_MS:-100}"
 gpu="${GPU:-0}"
 sensor_width="${SENSOR_WIDTH:-960}"
 sensor_height="${SENSOR_HEIGHT:-720}"
 
-[ -x "${python_bin}" ] || { echo "Python not executable: ${python_bin}" >&2; exit 1; }
-[ -d "${learning_root}/src/learning_everything" ] || { echo "Missing learning_everything: ${learning_root}" >&2; exit 1; }
+command -v "${python_bin}" >/dev/null || { echo "Python not found: ${python_bin}" >&2; exit 1; }
+[ -d "${project_dir}/runtime/nrv_e2fai" ] || { echo 'Missing bundled E2FAI runtime.' >&2; exit 1; }
 [ -f "${image_checkpoint}" ] || { echo "Missing image checkpoint: ${image_checkpoint}" >&2; exit 1; }
 [ -f "${backbone}" ] || { echo "Missing E2FAI checkpoint: ${backbone}" >&2; exit 1; }
 if [ "${HEADLESS:-false}" != true ] && [ -z "${DISPLAY:-}" ]; then
@@ -43,7 +44,7 @@ trap cleanup EXIT INT TERM
 
 echo "Output: ${run_dir}"
 echo "Starting E2FAI on physical GPU ${gpu}; Ctrl+C stops and saves the last frame."
-CUDA_VISIBLE_DEVICES="${gpu}" PYTHONPATH="${learning_root}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+CUDA_VISIBLE_DEVICES="${gpu}" PYTHONPATH="${project_dir}/runtime${PYTHONPATH:+:${PYTHONPATH}}" \
   "${python_bin}" "${project_dir}/examples/e2fai_realtime.py" "${host_args[@]}" &
 host_pid=$!
 
