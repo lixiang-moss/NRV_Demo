@@ -30,9 +30,9 @@ from nrv_e2fai.visualization import flow_hsv_rgb
 from performance import PerfRecorder
 
 DEFAULT_QUEUE_BATCHES = 256
-DEFAULT_QUEUE_BYTES = 1024 * 1024 * 1024
-QUEUE_TRIGGER_BYTES = 512 * 1024 * 1024
-QUEUE_TARGET_BYTES = 256 * 1024 * 1024
+DEFAULT_QUEUE_BYTES = 2 * 1024 * 1024 * 1024
+QUEUE_TRIGGER_BYTES = 1024 * 1024 * 1024
+QUEUE_TARGET_BYTES = 512 * 1024 * 1024
 WAIT_LIMIT_NS = 250_000_000
 WAIT_TARGET_NS = 125_000_000
 
@@ -684,7 +684,7 @@ def parse_args(argv=None):
     parser.add_argument("--result-mode", choices=("inline", "thread"), default="thread",
                         help="CPU rendering/packing and TCP sending mode (default: thread)")
     parser.add_argument("--queue-batches", type=int, default=DEFAULT_QUEUE_BATCHES,
-                        help="Host FIFO batch limit; byte limit is 1 GiB (1024 MiB)")
+                        help="Host FIFO batch limit; byte limit is 2 GiB (2048 MiB)")
     parser.add_argument("--no-freshness", dest="freshness", action="store_false",
                         help="Disable waiting-time catch-up only; capacity catch-up remains enabled")
     parser.add_argument("--sensor-width", type=int, default=960)

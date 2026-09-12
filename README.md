@@ -18,7 +18,7 @@ The host environment uses Python 3.10, PyTorch 2.1.1, NumPy 1.26.4, and OpenCV 4
 
 ## Views and camera controls
 
-The three default views are **Original rendering**, **E2FAI reconstruction**, and **E2FAI optical flow**. Use **Views** to select 1–3 panels. One fills the area, two are side by side, and three use two columns. Hiding a panel does not stop the model or alter its input.
+The three default views are **Original rendering**, **E2FAI reconstruction**, and **E2FAI optical flow**. Use **Views** to select 1–3 panels. One fills the area; two or three are arranged side by side in a single row. Hiding a panel does not stop the model or alter its input.
 
 Incoming pixmaps no longer determine layout size, so asynchronous image arrival does not resize adjacent panels. The main window remains freely resizable.
 
@@ -36,7 +36,7 @@ Defaults are **250 ms half-open windows `[start, end)`, native 960×720 resoluti
 
 The default `E2FAI_RESULT_MODE=thread` moves CPU result visualization and TCP transmission to an ordered worker thread so they can overlap subsequent inference. The result queue still holds at most one pending job; catch-up invalidates older generations. Set `E2FAI_RESULT_MODE=inline` to restore serial result handling for comparison or rollback.
 
-The host FIFO has a **512 MiB catch-up trigger, 1 GiB (1024 MiB) hard limit, and 256 MiB cleanup target**. Reaching **256 batches** also trims the oldest whole batches to half the batch limit. Freshness control is **on by default**: a source callback age over **250 ms** triggers cleanup to **125 ms** or less. Either capacity or waiting time can trigger catch-up before insertion; retained events stay in order with unchanged timestamps. Completed windows waiting for inference are checked separately from their input-completion time. Normal 250 ms window collection is not counted as backlog. These limits constrain waiting, not camera-to-screen latency; 1 GiB limits only the host event FIFO, not total process memory.
+The host FIFO has a **1 GiB (1024 MiB) catch-up trigger, 2 GiB (2048 MiB) hard limit, and 512 MiB cleanup target**. Reaching **256 batches** also trims the oldest whole batches to half the batch limit. Freshness control is **on by default**: a source callback age over **250 ms** triggers cleanup to **125 ms** or less. Either capacity or waiting time can trigger catch-up before insertion; retained events stay in order with unchanged timestamps. Completed windows waiting for inference are checked separately from their input-completion time. Normal 250 ms window collection is not counted as backlog. These limits constrain waiting, not camera-to-screen latency; 2 GiB limits only the host event FIFO, not total process memory.
 
 `E2FAI_FRESHNESS=false ./scripts/run.sh` disables the waiting-time policy; capacity recovery remains active. `E2FAI_QUEUE_BATCHES` overrides the default 256-batch guard. The C++ sender FIFO keeps its 32-batch / 256 MiB bounds and drops unsent old batches on overflow, preserving any packet already being transmitted. Catch-up clears partial windows and ConvGRU state, invalidates older results, and displays “正在追赶” in the GUI. See [catch-up changes and short checks](docs/E2FAI自动追赶与短测.md). Earlier recorded camera tests do not validate this new policy's live performance.
 

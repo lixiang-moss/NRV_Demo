@@ -184,8 +184,7 @@ class NoiseWindow(Q.QMainWindow):
         for key, panel in self.view_panels.items():
             panel.setVisible(key in visible)
         for index, key in enumerate(visible):
-            row, column = (0, index) if len(visible) < 3 else divmod(index, 2)
-            self.view_grid.addWidget(self.view_panels[key], row, column)
+            self.view_grid.addWidget(self.view_panels[key], 0, index)
         for key, action in self.view_actions.items():
             action.setEnabled(len(visible) > 1 or key not in visible)
         self.views_button.setText('Views ({})'.format(len(visible)))

@@ -48,16 +48,16 @@ class QueueTests(unittest.TestCase):
         mib = 1024 * 1024
         fifo = BoundedEventQueue()
         for seq in range(3):
-            fifo.trim(1, (self.batch(seq, 1), 128 * mib))
-        reason, dropped = fifo.trim(1, (self.batch(3, 1), 128 * mib))
+            fifo.trim(1, (self.batch(seq, 1), 256 * mib))
+        reason, dropped = fifo.trim(1, (self.batch(3, 1), 256 * mib))
         self.assertEqual(reason, 'queue_capacity')
-        self.assertEqual(dropped, [2, 6, 256 * mib])
-        self.assertEqual(fifo.bytes, 256 * mib)
+        self.assertEqual(dropped, [2, 6, 512 * mib])
+        self.assertEqual(fifo.bytes, 512 * mib)
         self.assertEqual([fifo.get()[1]['batch_seq'] for _ in range(2)], [2, 3])
-        reason, dropped = fifo.trim(1, (self.batch(4, 1), 1024 * mib + 1))
+        reason, dropped = fifo.trim(1, (self.batch(4, 1), 2048 * mib + 1))
         self.assertEqual(dropped[0], 1)
         self.assertEqual(fifo.bytes, 0)
-        self.assertLess(fifo.peak_bytes, 1024 * mib)
+        self.assertLess(fifo.peak_bytes, 2048 * mib)
 
     def test_freshness_uses_callback_age_and_retains_recent_suffix(self):
         fifo = BoundedEventQueue()
@@ -107,7 +107,7 @@ class QueueTests(unittest.TestCase):
         fifo = BoundedEventQueue()
         for index in range(256):
             fifo.put(index, 1)
-        with self.assertRaisesRegex(OverflowError, "256 batches / 1024 MiB"):
+        with self.assertRaisesRegex(OverflowError, "256 batches / 2048 MiB"):
             fifo.put(256, 1)
         self.assertEqual([fifo.get() for _ in range(256)], list(range(256)))
 
@@ -117,13 +117,13 @@ class QueueTests(unittest.TestCase):
             fifo.put("large", 11)
         self.assertIsNone(fifo.get())
 
-    def test_default_byte_capacity_accepts_one_gib_and_rejects_next_byte(self):
+    def test_default_byte_capacity_accepts_two_gib_and_rejects_next_byte(self):
         fifo = BoundedEventQueue()
-        self.assertEqual(fifo.max_bytes, 1024 * 1024 * 1024)
-        # Exercise size accounting without allocating a gigabyte of test data.
-        fifo.put("first", 512 * 1024 * 1024)
-        fifo.put("second", 512 * 1024 * 1024)
-        with self.assertRaisesRegex(OverflowError, "1024 MiB"):
+        self.assertEqual(fifo.max_bytes, 2 * 1024 * 1024 * 1024)
+        # Exercise size accounting without allocating two gigabytes of test data.
+        fifo.put("first", 1024 * 1024 * 1024)
+        fifo.put("second", 1024 * 1024 * 1024)
+        with self.assertRaisesRegex(OverflowError, "2048 MiB"):
             fifo.put("overflow", 1)
         self.assertEqual([fifo.get(), fifo.get()], ["first", "second"])
         self.assertEqual(fifo.bytes, 0)
