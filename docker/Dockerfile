@@ -32,6 +32,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ros-noetic-event-camera-codecs="${NRV_CODECS_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
 
+RUN apt-get update && apt-get install -y --no-install-recommends nlohmann-json3-dev patch \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker/patches/group_aer_timestamps.patch /tmp/group_aer_timestamps.patch
+RUN patch --batch --forward /opt/ros/noetic/include/event_camera_codecs/group_aer_decoder.h /tmp/group_aer_timestamps.patch
+
 COPY ros_ws/src /opt/nrv_demo_ws/src
 RUN source /opt/ros/noetic/setup.bash \
     && cd /opt/nrv_demo_ws \

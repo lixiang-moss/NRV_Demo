@@ -8,6 +8,17 @@
   <arg name="output_dir" default="/output/manual" />
   <arg name="message_threshold_time_ms" default="10" />
   <arg name="image_fps" default="10" />
+  <arg name="start_driver" default="true" />
+  <arg name="e2fai_enabled" default="true" />
+  <arg name="e2fai_host" default="127.0.0.1" />
+  <arg name="e2fai_port" default="8765" />
+  <arg name="session_id" default="" />
+  <arg name="perf_enabled" default="false" />
+  <arg name="perf_interval_s" default="5" />
+  <arg name="perf_capacity" default="4096" />
+  <arg name="profile_path" default="/output/last_applied_parameters.json" />
+  <arg name="auto_start" default="true" />
+  <arg name="visible_views" default="[]" />
 
   <node name="nrv_gui" pkg="nrv_demo" type="gui.py" required="true" output="screen">
     <param name="serial_number" type="str" value="$(arg serial_number)" />
@@ -17,5 +28,15 @@
     <param name="output_dir" type="str" value="$(arg output_dir)" />
     <param name="message_threshold_time_ms" type="str" value="$(arg message_threshold_time_ms)" />
     <param name="image_fps" type="str" value="$(arg image_fps)" />
+    <param name="start_driver" value="$(arg start_driver)" />
+    <param name="e2fai_enabled" value="$(arg e2fai_enabled)" />
+    <param name="e2fai_host" value="$(arg e2fai_host)" />
+    <param name="e2fai_port" value="$(arg e2fai_port)" />
+    <param name="perf_enabled" value="$(arg perf_enabled)" />
+    <param name="perf_interval_s" value="$(arg perf_interval_s)" />
+    <param name="perf_capacity" value="$(arg perf_capacity)" />
+    <param name="profile_path" value="$(arg profile_path)" />
+    <param name="auto_start" value="$(arg auto_start)" />
+    <rosparam param="visible_views" subst_value="true">$(arg visible_views)</rosparam>
   </node>
 </launch>

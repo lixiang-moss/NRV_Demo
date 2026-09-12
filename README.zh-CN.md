@@ -2,171 +2,100 @@
 
 [English](README.md) | **简体中文**
 
-NRV DELTA01 的独立 **Docker + ROS1 Noetic + Python 3** 示例：接收 RAW 事件流，同时查看官方渲染画面和 Python 算法输出。
+NRV DELTA01 的 E2FAI 重建与光流演示，以 `12fe7f9` 为工程基线。ROS、Qt 与官方原图渲染运行在容器内；E2FAI 运行在宿主机 GPU 进程，通过本机 TCP 与 C++ ROS 桥通信。原 Python 质心算法和软件过滤器已移除。
 
-本仓库只包含演示必需的两个 ROS 包、容器配置和操作脚本。镜像基于公开的官方 `ros:noetic-ros-core-focal`（Ubuntu 20.04），SDK 运行库、官方驱动和解码库从 NRV 软件源安装。
+## 启动
 
-## 快速开始
-
-宿主机要求：Linux x86_64、Docker Engine、Docker Compose v2、Python 3。双窗口显示还需要 X11 或 XWayland、`DISPLAY` 和 `xhost`（Ubuntu 的 `x11-xserver-utils` 包）。ROS 和算法依赖全部在容器里。
-
-接上 NRV DELTA01，先停止占用同一相机的 Viewer、jAER 或其他采集程序。
+宿主机需要 Linux x86_64、Docker Engine / Compose v2、Conda、支持 CUDA 12.1 PyTorch 构建的 NVIDIA 驱动；GUI 需要 X11 或 XWayland、`DISPLAY` 和 `xhost`。先停止占用相机的其他程序。
 
 ```bash
-git clone https://github.com/lixiang-moss/NRV_Demo.git
-cd NRV_Demo
+./scripts/setup_e2fai.sh  # 首次创建宿主模型环境
+./scripts/build.sh      # 首次构建或修改容器内代码后重建
 ./scripts/run.sh
 ```
 
-第一次会自动构建镜像 `nrv-demo:noetic`。也可以先执行 `./scripts/build.sh` 单独构建。
+环境为 Python 3.10、PyTorch 2.1.1、NumPy 1.26.4、OpenCV 4.7.0.72。启动器默认使用 `~/miniconda3/envs/nrv-e2fai/bin/python`，可用 `E2FAI_PYTHON` 指定其他位置。配套权重放在 `checkpoints/e2fai_backbone.ckpt` 和 `checkpoints/image_residual_epoch043.pt`；安装脚本不下载权重。
 
-默认打开全英文 GUI，展示左右两幅画面。调参面板默认隐藏；点击顶部 **Settings** 展开，再次点击收起。隐藏面板不会改变当前参数或停止过滤。
+## 画面与相机参数
 
-- **左侧** `/delta_renderer/image`：官方原始事件渲染。
-- **右侧** `/nrv_python_demo/image`：降噪后的事件和黄色质心标记。
+默认显示三幅画面：**Original rendering**（官方事件原图）、**E2FAI reconstruction**（重建灰度图）、**E2FAI optical flow**（光流彩色预览）。在 **Views** 选择 1–3 幅；一幅占满，两幅并排，三幅按两列排列。隐藏画面只影响显示，不停止模型或改变输入。
 
-在镜头前移动物体，观察处理结果。Python 画面中绿色表示 ON，蓝色表示 OFF。质心仅用于演示算法接入，不是目标检测。
+图像控件不再用收到的 Pixmap 尺寸决定布局，因此异步到图不会挤动其他画面；主窗口仍可自由缩放。
 
-## 在 GUI 中调整噪声
+**Settings** 中保留 ON/OFF 硬件参数。编辑后点击 **Apply parameters** 生效；修改硬件参数会重启采集并创建新模型会话。ON/OFF 是寄存器 `0x0167` / `0x0168` 的低 6 位十进制编码，范围 0–63，不是标定后的灵敏度。GUI 保留源配置的其他位和参数。硬件参数影响原图与模型输入。
 
-1. 点击 **Settings** 打开调参面板。先保持两个软件过滤器关闭，分别观察静止场景和移动物体。
-2. 勾选 **Neighbour filter / 去孤立噪点**，从 **5 ms** 开始。事件的 3×3 邻域中，必须有其他像素在此前的时间窗口内触发；窗口越短，过滤越严格。孤立事件簇的第一个事件会被丢弃；被丢弃的输入事件仍可为后续邻居提供支持。
-3. 勾选 **Pixel interval / 抑制同像素重复事件**，从 **1 ms** 开始。间隔越长，抑制越强，也可能丢掉快速运动。间隔从该像素上次保留的事件起计算，不区分极性。
-4. 修改参数后统一点击 **Apply parameters** 才生效；仅修改软件参数时无需重启采集，默认均关闭。右侧展示过滤后的质心；底部显示输入事件速率、本次采集的累计保留比例及 RAW 序号间断数。应用新的过滤参数会清空过滤器历史。
-5. **ON / OFF** 每次调整一个数值步长，再点击 **Apply parameters**。GUI 将配置写入当前输出目录的 `sensor_settings.txt`，并一起重启驱动、解码器、渲染器和 Python，其他传感器配置保持不变。每次调整后对比背景噪点与运动边缘。
+**Save profile / Load profile** 保存相机参数和画面选择。加载相机参数后仍须 Apply；画面选择立即生效。旧配置的 `filters` 被忽略，旧 `algorithm` 画面被移除；如果没有剩余画面，恢复默认三幅。自动保存位置为 `output/last_applied_parameters.json`。
 
-ON/OFF 是 `0x0167` / `0x0168` 的**低 6 位十进制寄存器值**，范围 0–63，不是标定后的灵敏度。数值增大不代表降噪一定增强。粗调与参考路径设置继承加载的传感器文件，GUI 不修改它们。寄存器映射参考 [jAER 的 NRV 实现](https://github.com/SensorsINI/jaer/blob/master/src/nrv/README.md)。
+**Stop** 停止采集及当前推理会话、清空循环状态，保留已加载权重。**Start** 创建新会话，旧结果不会进入新画面。关闭 GUI 或 Ctrl+C 后，启动器退出 GPU 进程并释放端口。
 
-**保存参数 / 加载参数**使用 JSON 保存 ON/OFF 和软件设置。加载只填入控件，点击 **Apply parameters** 后统一生效；修改了相机参数时会自动重启采集。开始采集使用上次已应用的设置。相机参数会影响此后采集的 RAW；软件过滤不修改 `/delta_driver/events` 或 `/dvs/events`。Python 示例通过一个小型原生计算模块逐事件执行过滤。
+## 模型与时间尺度
 
-每次点击 **Apply parameters**，都会自动将已应用的 ON/OFF 和软件参数保存到 `output/last_applied_parameters.json`。下次打开自动恢复，容器重启后同样保留；尚未点击应用的修改不会被记住。
+默认使用 **250 ms 半开窗口 `[start, end)`、960×720 原生分辨率、全部事件和 15-bin 体素**。保留 U-Net、光流池化与插值、ConvGRU 图像残差及两份权重。模型直接读取 `/dvs/events`；不排序、不插值替代真实事件时间、不抽样。
 
-**停止**结束采集并保留窗口，**开始采集**可再次启动。关闭 GUI 或按 **Ctrl+C** 退出。结果保存在 `output/run_*/summary.json` 和 `algorithm_last.png`；同一窗口内重新采集会用最新一轮结果覆盖这两个文件。定时 GUI 采集结束后窗口保留，方便查看。
+`32FC2` 光流单位是 **推理网格像素／输入窗口**，当前默认即像素／250 ms；若需平均像素速度，用光流除以实际窗口秒数。彩色预览默认饱和尺度为 **50 像素／250 ms**，对应 200 像素/秒，仅改变显示颜色，不改变浮点光流。跨窗循环状态在时间倒退、超过 **300 ms** 的真实事件断流、尺寸/连接变化或检测到批次间断时清理。输入队列超限会暂停会话并报告，Stop → Start 可重新开始。
 
-已有项目更新后，先执行一次 `./scripts/build.sh` 重建镜像，再启动。
+默认 `E2FAI_RESULT_MODE=thread`：CPU 结果转图与 TCP 回传由独立线程按顺序执行，可与后续推理重叠；保留有界队列和背压，不丢弃窗口。设置 `E2FAI_RESULT_MODE=inline` 可恢复串行结果处理，便于对照或撤回。
+
+宿主输入队列默认最多 **64 个 ROS 事件批次或 1 GiB（1024 MiB）**，先达到者生效；这不是 64 个推理窗口。用 `E2FAI_QUEUE_BATCHES=128 ./scripts/run.sh` 可调整批数，设为 `32` 可恢复之前的上限。容器 C++ 发送队列保持 32 批。加长队列可容纳更多突发，但不会提高模型处理速度，可能增加显示延迟。已有真机报告使用的是此前 256 MiB 上限；本次 1 GiB 扩容通过队列边界检查，未追加真机测试。
+
+解码时间保留逐事件顺序及传感器计数关系；约 4,295 秒的异常跳变在解码层修复，不用包头插值掩盖。映射事件时间计算出的年龄不等于标定后的物理端到端延迟。
 
 ## 常用命令
 
 ```bash
-# 采集 20 秒后停止，GUI 保留供查看
+# 必要的短时真机检查；结束采集后 GUI 保留
 DURATION=20 ./scripts/run.sh
 
-# 无桌面：保留 RAW、解码、两路图像消息，关闭查看窗口
+# 无界面，仍运行模型
 SHOW_GUI=false DURATION=20 ./scripts/run.sh
 
-# 只接收原始编码数据：关闭解码、算法图和官方 renderer
+# 开启周期性能记录（默认关闭）
+PERF_ENABLED=true DURATION=20 ./scripts/run.sh
+
+# 只看官方原图，不启动宿主模型
+E2FAI_ENABLED=false ./scripts/run.sh
+
+# 只接收 RAW，不解码、推理或渲染
 DECODE_EVENTS=false SHOW_GUI=false DURATION=20 ./scripts/run.sh
 
-# 多相机时指定 SDK 序列号，或用设备下标（默认 0）
-CAMERA_SERIAL=实际序列号 ./scripts/run.sh
+# 指定相机或覆盖窗口时长
 CAMERA_INDEX=1 ./scripts/run.sh
+WINDOW_MS=250 ./scripts/run.sh
 
-# 修改显示目标频率（实际帧率受事件量和 Python 处理速度影响）
-./scripts/run.sh image_fps:=15
-
-# 修改源码后重新构建
-./scripts/build.sh
+# 撤回结果线程，保留 250 ms 窗口
+E2FAI_RESULT_MODE=inline ./scripts/run.sh
 ```
 
-USB 通过 `/dev/bus/usb` 和 USB 设备 cgroup 规则提供给容器。脚本临时授予 root 容器 X11 访问权，退出后撤销。ROS 使用 host 网络，默认只面向本机；先停止同名的其他 ROS 演示。
-
-## 流程和节点
+## 数据链路与结果
 
 ```mermaid
-flowchart TD
-    Camera[NRV DELTA01 USB] --> Driver
-    subgraph Manager[delta_manager 进程]
-      Driver[delta_driver · 官方 DriverNodelet]
-      Adapter[dvs/event_adapter · 本项目适配器]
-      Renderer[delta_renderer · 官方 RendererNodelet]
-      Driver -->|/delta_driver/events · EventPacket| Adapter
-      Driver -->|/delta_driver/events · EventPacket| Renderer
-    end
-    Driver -->|RAW 字节及元数据| Python[nrv_python_demo · Python 进程]
-    Adapter -->|/dvs/events · EventArray| Python
-    Renderer -->|/delta_renderer/image| GUI[nrv_gui · 参数与双画面]
-    Renderer -->|图像接收计数| Python
-    Python -->|/nrv_python_demo/image| GUI
-    GUI -->|/nrv_noise 参数| Python
-    GUI -. 应用并重启 .-> Manager
+flowchart LR
+  Camera[DELTA01] --> Driver[官方驱动]
+  Driver -->|RAW| Renderer[官方渲染]
+  Driver -->|RAW| Adapter[逐事件解码]
+  Driver -->|RAW| Monitor[采集计数]
+  Adapter -->|/dvs/events| Bridge[C++ ROS桥]
+  Bridge <-->|本机TCP| Model[宿主GPU E2FAI]
+  Renderer --> GUI[Qt 1–3幅画面]
+  Bridge -->|/nrv_e2fai/result| GUI
+  Monitor -->|/nrv_capture/status| GUI
 ```
 
-`roslaunch` 在需要时自动启动 `roscore`。驱动、适配器、renderer 在同一 nodelet manager 内；Python 和 GUI 是独立进程。GUI 管理子 roslaunch 的整条采集流程，重启采集时主 ROS master 保持运行。
+驱动、解码器、渲染器共享 nodelet manager 进程；采集计数、C++ 桥和 GUI 各自独立。TCP 默认监听 `127.0.0.1:8765`。Qt 使用最新图像缓存，不等待推理完成。
 
-| Topic | ROS 消息 | 内容 |
-| --- | --- | --- |
-| `/delta_driver/events` | `event_camera_msgs/EventPacket` | 官方 RAW 编码载荷、序号、编码方式、时间信息、宽高 |
-| `/dvs/events` | `dvs_msgs/EventArray` | 解码后的 `(x, y, ts, polarity)` 事件数组 |
-| `/dvs/camera_info` | `sensor_msgs/CameraInfo` | 相机信息；本示例未提供标定参数，重心算法无需标定 |
-| `/delta_renderer/image` | `sensor_msgs/Image` | 官方渲染画面 |
-| `/nrv_python_demo/image` | `sensor_msgs/Image`，`bgr8` | Python 算法画面 |
-
-两幅画面各自累积事件，显示时间窗不严格同步。默认图像目标频率为 10 Hz；RAW 订阅不会因为显示频率而抽样。
-
-## 对方算法如何接收 RAW
-
-运行演示后，在仓库目录下打开另一个终端：
-
-```bash
-docker compose run --rm nrv-demo python3 /examples/raw_receiver.py
-```
-
-[examples/raw_receiver.py](examples/raw_receiver.py) 是可直接改写的最小 Python 接收节点，核心接口是：
-
-```python
-from event_camera_msgs.msg import EventPacket
-
-def on_raw(msg):
-    payload = memoryview(msg.events)
-    # 在这里调用对方算法，传入 payload 和所需元数据。
-
-subscriber = rospy.Subscriber("/delta_driver/events", EventPacket, on_raw,
-                              queue_size=100, buff_size=16 * 1024 * 1024)
-```
-
-`examples/` 以只读方式挂载到容器，修改宿主机的接收脚本后重新运行即可，不用重建镜像。容器入口已经 source ROS 和工作空间；需要交互调试时执行 `docker compose run --rm nrv-demo bash`。
-
-**RAW 的含义**：`msg.events` 是 `uint8[]`，在 rospy 接收端为字节载荷；当前驱动编码为 `group_aer`。它不是逐事件坐标数组，也不是完整 `.dvs` 文件。对方若要求 `.dvs` 文件格式，需要另行使用文件录制接口。
-
-向下游传递时保留 `encoding`、`seq`、`time_base`、`header`、`width`、`height` 和 `is_bigendian`。`group_aer` 的解码器维护跨包状态，时间含义应按对应编码解释，不能把包头时间当成每个事件的时间。
-
-如果对方需要的是 `(x,y,t,p)`，直接订阅 `/dvs/events`，参考 [demo.py](ros_ws/src/nrv_demo/scripts/demo.py) 的 `on_events()`。`event.ts` 为适配器映射后的 ROS 时间，`polarity=True` 表示 ON。替换 `publish_algorithm_image()` 中的处理并继续发布 `sensor_msgs/Image`，即可复用算法结果窗口。
-
-## 检查是否跑通
-
-终端每秒显示 RAW 包数、字节数、吞吐、序号跳变数、解码事件数和两路图像计数。
-
-双画面模式最终 `PASS` 要求：
-
-1. Python 收到非空 RAW 载荷。
-2. 从接收到的第一个 RAW 包起，`seq` 连续。
-3. Python 收到解码事件和官方 renderer 图像。
-4. Python 已发布算法图像。
-
-RAW-only 模式只检查前两项。`summary.json` 保存具体计数和各项检查；脚本按结果返回 `PASS=0`、`FAIL=1`。有时长限制时，Python 正常结束会触发 launch 整组退出，ROS 的 `REQUIRED process ... has died! / process has finished cleanly` 是这种收尾机制的提示。
-
-该检查证明数据通路接通；包序号连续不等于相机内部无丢失，也不检查窗口可见性。Python 的逐事件对象反序列化和算法负载可能使解码支路降帧或丢包，实际算法需在目标事件率下测量。对方只需要 RAW 时，使用 RAW-only 模式。
-
-| 现象 | 操作 |
+| 话题 | 内容 |
 | --- | --- |
-| 没有 RAW 包 | 检查 USB 是否识别为 `04b4:00f1`，确认相机未被其他程序占用；检查序列号/下标和驱动日志 |
-| RAW 有数据、解码事件少或为零 | 在镜头前制造运动，查看适配器日志和 RAW 编码方式 |
-| RAW 序号跳变 | 检查驱动/接收端负载，先用 RAW-only 模式复测；避免在回调中大量打印或阻塞 I/O |
-| 图像计数增长但窗口不显示 | 在桌面终端检查 `DISPLAY`、`xhost`；无桌面使用 `SHOW_GUI=false` |
-| 改了包内算法却没变化 | 执行 `./scripts/build.sh` 重建镜像；`examples/` 脚本则无需重建 |
+| `/delta_driver/events` | `event_camera_msgs/EventPacket`：RAW 字节及原始元数据 |
+| `/dvs/events` | `dvs_msgs/EventArray`：按顺序的 `(x, y, ts, polarity)` |
+| `/delta_renderer/image` | 官方原图 |
+| `/nrv_e2fai/result` | 会话/窗口/来源批次元数据、`mono8` 灰度、`rgb8` 光流预览和 `32FC2` 光流 |
+| `/nrv_e2fai/status` | 桥连接、暂停状态和计数 |
+| `/nrv_capture/status` | RAW 包数、字节率和序号间断次数 |
 
-## 内容与依赖
+运行结果在 `output/run_*/`。`summary.json` 只检查 RAW 是否接收及序号连续性；`raw_sequence_gaps` 是间断**次数**。模型和桥分别保存 `e2fai_session_*.json`、`sessions/<session>/bridge_summary.json`。`integration_summary.json` 检查 RAW、模型出图、会话错误与 ROS 批次间断；合法时间重置单独记录，不自动判失败。PASS 不代表实时性能验收。设置 `PERF_ENABLED=true` 时另写周期 `performance_*.jsonl`。GUI 显示时间测量截止 `setPixmap`，不是显示器实际呈现时刻。
 
-```text
-compose.yaml                         容器运行配置
-docker/                              独立镜像和入口
-scripts/build.sh, scripts/run.sh      构建、一键运行
-examples/raw_receiver.py              对方算法接入最小示例
-ros_ws/src/nrv_demo/                  Python 示例、适配器、完整 launch
-ros_ws/src/dvs_msgs/                  Event / EventArray 消息及原始许可证
-output/                              本地运行结果，不进入 Git 或构建上下文
-```
+当前结果见 [E2FAI 250 ms 与结果线程实测](docs/E2FAI250ms与结果线程实测.md)，以 Markdown 交付。之前的[E2FAI 修复与真机短测](docs/E2FAI修复与真机短测.md)和[移植后性能测试与瓶颈分析](docs/移植后性能测试与瓶颈分析.md)保留为历史记录，其中旧窗口时长与旧桥接实现的数据不代表当前版本性能。
 
-固定依赖：Ubuntu 20.04、ROS Noetic、`libdelta-sdk=1.2.2-1~ubuntu20.04`、`ros-noetic-delta-driver/tools=1.2.0-0focal`、`event-camera-msgs=2.0.1-0focal`、`event-camera-codecs=1.0.0-0focal`。首次构建需要能访问 Ubuntu、ROS 和 [NRV 软件源](https://nrvcorp.github.io/camera/apt/ubuntu20.04/)；仓库不包含厂商二进制或录像，也不安装厂商 Viewer。
+[examples/raw_receiver.py](examples/raw_receiver.py) 保留为独立 RAW 接收示例，不在演示链路中运行。`group_aer` 是带跨包状态的编码数据，不是完整 `.dvs` 文件；下游需保留编码、序号、时间基准、宽高等元数据。
 
-代码从 [event-camera-lab](https://github.com/lixiang-moss/event-camera-lab) 的 NRV 示例提取。`dvs_msgs` 的两条消息来自 [rpg_dvs_ros](https://github.com/uzh-rpg/rpg_dvs_ros)，按 MIT 保留其许可证。NRV SDK/驱动/codec 按各自发行许可使用；本仓库示例代码采用 [MIT](LICENSE)。
+镜像依赖 Ubuntu 20.04、ROS Noetic 与 NRV SDK/驱动。修改容器内代码后执行 `./scripts/build.sh`。USB 通过 `/dev/bus/usb` 提供，启动器临时授予容器 X11 权限并在退出时撤销。代码采用 [MIT](LICENSE)；厂商依赖和 `dvs_msgs` 按各自许可使用。

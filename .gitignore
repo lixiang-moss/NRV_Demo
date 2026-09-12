@@ -7,3 +7,5 @@ __pycache__/
 .env
 *.bag
 *.dvs
+checkpoints/*.ckpt
+checkpoints/*.pt

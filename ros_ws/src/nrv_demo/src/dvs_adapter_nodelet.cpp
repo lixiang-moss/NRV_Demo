@@ -1,8 +1,20 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <fstream>
+#include <iomanip>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
+#include <nrv_demo/performance.hpp>
 #include <camera_info_manager/camera_info_manager.h>
 #include <dvs_msgs/EventArray.h>
 #include <event_camera_codecs/decoder_factory.h>
@@ -15,6 +27,8 @@
 
 
 namespace nrv_demo {
+
+using AdapterPerformance = PerformanceRecorder;
 
 class SequenceTracker {
  public:
@@ -68,15 +82,30 @@ class DvsAdapterNodelet : public nodelet::Nodelet {
                                                : packet_stamp_.toNSec();
       have_anchor_ = true;
     }
-    if (sensor_time < sensor_anchor_ns_) {
+    if (have_previous_sensor_time_ && sensor_time < previous_sensor_time_ns_) {
       ++time_reversals_;
-      return;
+    }
+    previous_sensor_time_ns_ = sensor_time;
+    have_previous_sensor_time_ = true;
+    // Keep the original epoch anchor, including when the sensor clock resets.
+    // Subtract in the correct direction: unsigned wrap would conceal the reset.
+    uint64_t mapped_ns;
+    if (sensor_time >= sensor_anchor_ns_) {
+      const uint64_t offset = sensor_time - sensor_anchor_ns_;
+      if (offset > UINT64_MAX - ros_anchor_ns_)
+        throw std::overflow_error("sensor-to-ROS timestamp exceeds uint64 nanoseconds");
+      mapped_ns = ros_anchor_ns_ + offset;
+    } else {
+      const uint64_t offset = sensor_anchor_ns_ - sensor_time;
+      if (offset > ros_anchor_ns_)
+        throw std::underflow_error("sensor-to-ROS timestamp would precede the ROS epoch");
+      mapped_ns = ros_anchor_ns_ - offset;
     }
     dvs_msgs::Event event;
     event.x = x;
     event.y = y;
     event.polarity = polarity != 0U;
-    event.ts.fromNSec(ros_anchor_ns_ + sensor_time - sensor_anchor_ns_);
+    event.ts.fromNSec(mapped_ns);
     message_.events.push_back(event);
   }
 
@@ -98,6 +127,19 @@ class DvsAdapterNodelet : public nodelet::Nodelet {
     if (event_reserve_ < 1 || subscriber_queue_size_ < 1) {
       throw std::runtime_error("adapter queue and reserve values must be positive");
     }
+    bool perf_enabled = false;
+    private_nh.param("perf_enabled", perf_enabled, false);
+    if (perf_enabled) {
+      double interval = 5.0;
+      int capacity = 4096;
+      std::string output_dir;
+      private_nh.param("perf_interval_s", interval, 5.0);
+      private_nh.param("perf_capacity", capacity, 4096);
+      private_nh.param<std::string>("perf_output_dir", output_dir, "/output");
+      if (!std::isfinite(interval) || interval <= 0 || capacity < 1)
+        throw std::runtime_error("performance interval and capacity must be positive");
+      perf_.reset(new AdapterPerformance(output_dir + "/performance_adapter.jsonl", "adapter", interval, capacity));
+    }
 
     message_.events.reserve(static_cast<std::size_t>(event_reserve_));
     publisher_ = nh.advertise<dvs_msgs::EventArray>(output_topic_, 100);
@@ -113,6 +155,15 @@ class DvsAdapterNodelet : public nodelet::Nodelet {
   }
 
   void packetCallback(const event_camera_msgs::EventPacket::ConstPtr &packet) {
+    const auto tick = perf_ ? AdapterPerformance::Clock::now() : AdapterPerformance::Tick{};
+    double packet_age_ms = 0;
+    uint64_t callback_ros_ns = 0;
+    if (perf_) {
+      const auto callback_ros_time = ros::Time::now();
+      callback_ros_ns = callback_ros_time.toNSec();
+      if (!packet->header.stamp.isZero())
+        packet_age_ms = (callback_ros_time - packet->header.stamp).toSec() * 1000;
+    }
     sequence_.observe(packet->seq);
     packet_stamp_ = packet->header.stamp;
     message_.events.clear();
@@ -127,12 +178,17 @@ class DvsAdapterNodelet : public nodelet::Nodelet {
       return;
     }
     decoder->setTimeMultiplier(1000U);
+    const auto decode_tick = perf_ ? AdapterPerformance::Clock::now() : AdapterPerformance::Tick{};
     while (decoder->decode(*packet, &processor_)) {
     }
+    const auto decoded = perf_ ? AdapterPerformance::Clock::now() : AdapterPerformance::Tick{};
+    AdapterPerformance::Tick publish_tick{};
     if (!message_.events.empty()) {
       message_.header.stamp = message_.events.back().ts;
+      if (perf_) publish_tick = AdapterPerformance::Clock::now();
       publisher_.publish(message_);
     }
+    const auto published = perf_ ? AdapterPerformance::Clock::now() : AdapterPerformance::Tick{};
     width_ = packet->width;
     height_ = packet->height;
     ++packets_;
@@ -141,6 +197,44 @@ class DvsAdapterNodelet : public nodelet::Nodelet {
       reported_gaps_ = sequence_.gapIncidents();
       NODELET_ERROR("adapter detected EventPacket sequence gap; total incidents=%llu",
                     static_cast<unsigned long long>(reported_gaps_));
+    }
+    if (perf_) {
+      const auto completed = AdapterPerformance::Clock::now();
+      const auto count = message_.events.size();
+      perf_->duration("callback", tick, completed, count, packet->seq);
+      perf_->duration("decode", decode_tick, decoded, count, packet->seq);
+      if (count) perf_->duration("publish", publish_tick, published, count, packet->seq);
+      if (!packet->header.stamp.isZero())
+        perf_->observe("raw_packet_age", packet_age_ms, count, packet->seq);
+      perf_->observe("raw_gap_incidents_cumulative", sequence_.gapIncidents(), 0, packet->seq, "count");
+      perf_->observe("raw_missing_packets_cumulative", sequence_.missingPackets(), 0, packet->seq, "count");
+      perf_->observe("raw_reordered_or_reset_cumulative", sequence_.reorderedOrReset(), 0, packet->seq, "count");
+      perf_->observe("time_reversals_cumulative", time_reversals_, 0, packet->seq, "count");
+      const auto callback_ns = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(tick.time_since_epoch()).count());
+      // One paired packet per second is sufficient to compare clock progression.
+      // All allocation and additional metadata work stay behind the PERF switch.
+      if (!last_timestamp_pair_ns_ || callback_ns - last_timestamp_pair_ns_ >= 1000000000ULL) {
+        AdapterPerformance::Metadata metadata{
+            {"raw_sequence", packet->seq}, {"raw_header_stamp_ns", packet->header.stamp.toNSec()},
+            {"callback_monotonic_ns", callback_ns}, {"callback_ros_ns", callback_ros_ns},
+            {"event_count", count}, {"sensor_anchor_ns", sensor_anchor_ns_},
+            {"ros_anchor_ns", ros_anchor_ns_}};
+        if (count) {
+          const auto first_ns = message_.events.front().ts.toNSec();
+          const auto last_ns = message_.events.back().ts.toNSec();
+          // Invert the existing fixed anchor only for diagnostics; event values are untouched.
+          const auto sensor_ns = [this](uint64_t mapped_ns) {
+            return mapped_ns >= ros_anchor_ns_ ? sensor_anchor_ns_ + (mapped_ns - ros_anchor_ns_)
+                                              : sensor_anchor_ns_ - (ros_anchor_ns_ - mapped_ns);
+          };
+          metadata.insert({{"event_first_ns", first_ns}, {"event_last_ns", last_ns},
+                           {"sensor_first_ns", sensor_ns(first_ns)},
+                           {"sensor_last_ns", sensor_ns(last_ns)}});
+        }
+        perf_->observe("timestamp_pair", 1, count, packet->seq, "packet", metadata);
+        last_timestamp_pair_ns_ = callback_ns;
+      }
     }
   }
 
@@ -167,6 +261,7 @@ class DvsAdapterNodelet : public nodelet::Nodelet {
   int subscriber_queue_size_{100};
   int event_reserve_{1048576};
   double camera_info_rate_{5.0};
+  std::unique_ptr<AdapterPerformance> perf_;
   ros::Subscriber subscriber_;
   ros::Publisher publisher_;
   ros::Publisher camera_info_publisher_;
@@ -179,6 +274,8 @@ class DvsAdapterNodelet : public nodelet::Nodelet {
   ros::Time packet_stamp_;
   uint64_t sensor_anchor_ns_{0};
   uint64_t ros_anchor_ns_{0};
+  uint64_t previous_sensor_time_ns_{0};
+  uint64_t last_timestamp_pair_ns_{0};
   uint64_t packets_{0};
   uint64_t events_{0};
   uint64_t time_reversals_{0};
@@ -186,6 +283,7 @@ class DvsAdapterNodelet : public nodelet::Nodelet {
   uint32_t width_{0};
   uint32_t height_{0};
   bool have_anchor_{false};
+  bool have_previous_sensor_time_{false};
 };
 
 void AdapterProcessor::eventCD(uint64_t sensor_time, uint16_t x, uint16_t y,

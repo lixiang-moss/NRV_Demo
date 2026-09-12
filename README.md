@@ -2,171 +2,100 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A standalone **Docker + ROS1 Noetic + Python 3** demo for the NRV DELTA01: receive RAW event streams while viewing both the official rendered image and Python algorithm output.
+E2FAI reconstruction and optical flow for the NRV DELTA01, using `12fe7f9` as the project baseline. ROS, Qt, and the official event renderer run in Docker; E2FAI runs in a separate host GPU process connected to a C++ ROS bridge over local TCP. The former Python centroid algorithm and software filters have been removed.
 
-This repository contains only the two ROS packages, container configuration, and scripts needed for the demo. The image uses the public official `ros:noetic-ros-core-focal` base (Ubuntu 20.04). The SDK runtime, official driver, and codecs are installed from the NRV package repository.
+## Start
 
-## Quick start
-
-Host requirements: Linux x86_64, Docker Engine, Docker Compose v2, and Python 3. The GUI requires X11 or XWayland, `DISPLAY`, and `xhost` (the `x11-xserver-utils` package on Ubuntu). ROS and algorithm dependencies run inside the container.
-
-Connect the NRV DELTA01 and stop any Viewer, jAER, or other capture application using the same camera.
+Requirements: Linux x86_64, Docker Engine / Compose v2, Conda, an NVIDIA driver compatible with the CUDA 12.1 PyTorch build, and X11/XWayland with `DISPLAY` and `xhost` for the GUI. Stop other programs using the camera first.
 
 ```bash
-git clone https://github.com/lixiang-moss/NRV_Demo.git
-cd NRV_Demo
+./scripts/setup_e2fai.sh  # Create the host model environment once
+./scripts/build.sh      # Build initially and after container source changes
 ./scripts/run.sh
 ```
 
-The first run automatically builds `nrv-demo:noetic`. To build it separately, run `./scripts/build.sh`.
+The host environment uses Python 3.10, PyTorch 2.1.1, NumPy 1.26.4, and OpenCV 4.7.0.72. The launcher defaults to `~/miniconda3/envs/nrv-e2fai/bin/python`; override with `E2FAI_PYTHON`. Supply both matching weights at `checkpoints/e2fai_backbone.ckpt` and `checkpoints/image_residual_epoch043.pt`; setup does not download weights.
 
-The default is an English GUI with two side-by-side images. Camera and noise controls are hidden initially; click **Settings** in the top bar to show them, and click it again to hide them. Hiding the panel keeps the current parameters active.
+## Views and camera controls
 
-- **Left** `/delta_renderer/image`: official original rendering.
-- **Right** `/nrv_python_demo/image`: retained events and their yellow centroid marker.
+The three default views are **Original rendering**, **E2FAI reconstruction**, and **E2FAI optical flow**. Use **Views** to select 1–3 panels. One fills the area, two are side by side, and three use two columns. Hiding a panel does not stop the model or alter its input.
 
-Move an object in front of the camera. Green pixels represent ON events and blue pixels OFF events in the Python view. The centroid is a simple integration example, not object detection.
+Incoming pixmaps no longer determine layout size, so asynchronous image arrival does not resize adjacent panels. The main window remains freely resizable.
 
-## Adjusting noise in the GUI
+**Settings** retains the hardware ON/OFF controls. Click **Apply parameters** to apply edits; hardware changes restart acquisition and create a new model session. ON/OFF are the low six bits of registers `0x0167` / `0x0168`, shown as decimal codes 0–63, not calibrated sensitivity. Other bits and sensor settings are preserved. Hardware settings affect both the original rendering and model input.
 
-1. Click **Settings** to open the parameter panel. Start with the filters unchecked and observe a stationary scene, then move an object.
-2. Enable **Neighbour filter** to remove isolated events. Start at **5 ms**: an event needs a different pixel in its 3×3 neighbourhood active within this preceding time window. A shorter window is stricter. The first event of an isolated cluster is discarded; incoming events provide support even when discarded.
-3. Enable **Pixel interval**, initially **1 ms**, to suppress repeated events at a pixel. A longer interval suppresses more events, including potentially useful fast motion. The interval is measured from the last retained event, independently of polarity.
-4. Edits are staged until you click **Apply parameters**. Software-only changes apply during acquisition without restarting. Both filters are off by default. The right view shows the filtered centroid; the status bar shows input events/s, cumulative retained percentage since the current capture started, and RAW sequence gaps. Filter history resets when changed settings are applied.
-5. Adjust **ON / OFF** by one register step, then click **Apply parameters**. The GUI writes `sensor_settings.txt` under the current output directory and restarts driver, decoder, renderer, and Python together. Other sensor settings are preserved. Compare noise and moving edges after every change.
+**Save profile / Load profile** stores camera settings and selected views. Loaded camera edits wait for Apply; view selection changes immediately. Old `filters` fields are ignored and the removed `algorithm` view is discarded. If no views remain, all three are selected. The applied profile is saved to `output/last_applied_parameters.json`.
 
-ON/OFF controls are **decimal low-six-bit register codes**, 0–63, at `0x0167` / `0x0168`; they are not calibrated sensitivity values. A larger code is not labelled as stronger noise reduction. The loaded sensor file determines the coarse/reference settings, which the GUI preserves. See the [jAER NRV register mapping](https://github.com/SensorsINI/jaer/blob/master/src/nrv/README.md).
+**Stop** ends acquisition and the inference session, clearing recurrent state while retaining loaded weights. **Start** creates a new session and rejects old results. Closing the GUI or pressing Ctrl+C stops the GPU process and releases its port.
 
-**Save profile / Load profile** stores ON/OFF codes and software settings as JSON. Loading fills the controls without changing active settings; click **Apply parameters** to apply all loaded settings. Start uses the last applied settings. Hardware changes affect newly captured RAW events; software filters never modify `/delta_driver/events` or `/dvs/events`. The sample Python algorithm uses a small native filter helper for event-by-event processing.
+## Model and time scale
 
-Every click on **Apply parameters** also saves the applied ON/OFF and software settings to `output/last_applied_parameters.json`. The next launch restores these automatically, including across container restarts. Unapplied edits are not remembered.
+Defaults are **250 ms half-open windows `[start, end)`, native 960×720 resolution, all events, and 15-bin voxels**. The complete U-Net, flow pooling/interpolation, ConvGRU image residual, and both checkpoints are retained. The model reads `/dvs/events` directly; input events are not sorted, sampled, or replaced with interpolated timestamps.
 
-**Stop** ends acquisition while keeping the window open; **Start** begins again. Close the GUI or press **Ctrl+C** to exit. Results are in `output/run_*/summary.json` and `algorithm_last.png`; restarting within the same window replaces these with the latest capture's results. A timed GUI run stops acquisition and leaves the window open for inspection.
+`32FC2` flow is measured in **inference-grid pixels per input window**, currently pixels per 250 ms. Divide by the actual window duration in seconds when mean pixel velocity is needed. The color preview defaults to a saturation scale of **50 pixels per 250 ms**, equivalent to 200 pixels/second; this affects preview colors only. Backward timestamps, real event gaps exceeding **300 ms**, dimension/connection changes, and detected batch discontinuities clear window and recurrent state. Queue overload pauses the session and reports an error; Stop → Start begins a fresh session.
 
-After updating an existing checkout, rebuild once with `./scripts/build.sh` before launching.
+The default `E2FAI_RESULT_MODE=thread` moves CPU result visualization and TCP transmission to an ordered worker thread so they can overlap subsequent inference. Bounded queues and backpressure remain; windows are not dropped. Set `E2FAI_RESULT_MODE=inline` to restore serial result handling for comparison or rollback.
 
-## Common commands
+The host input FIFO defaults to **64 ROS event batches or 1 GiB (1024 MiB)**, whichever fills first; these are not inference windows. Set `E2FAI_QUEUE_BATCHES=128 ./scripts/run.sh` to change the batch limit, or `32` to restore the previous limit. The C++ sender FIFO remains at 32 batches. More buffering can absorb bursts but does not accelerate inference and can increase display latency. The recorded camera tests used the previous 256 MiB limit; the current 1 GiB capacity has passed the queue boundary check, without an additional camera test.
+
+The decoder correction addresses the approximately 4,295-second timestamp jump while preserving event order and sensor counter relationships; it does not hide the anomaly with packet-header interpolation. Ages computed from mapped timestamps are not calibrated physical end-to-end latency.
+
+## Commands
 
 ```bash
-# Capture for 20 seconds; keep the GUI open for inspection
+# Short camera check; GUI remains after acquisition ends
 DURATION=20 ./scripts/run.sh
 
-# Headless: keep RAW, decoding, and both image topics; disable viewer windows
+# Headless acquisition and inference
 SHOW_GUI=false DURATION=20 ./scripts/run.sh
 
-# RAW only: disable decoding, algorithm images, and the official renderer
+# Optional periodic performance records, disabled by default
+PERF_ENABLED=true DURATION=20 ./scripts/run.sh
+
+# Official rendering without the host model
+E2FAI_ENABLED=false ./scripts/run.sh
+
+# RAW reception only
 DECODE_EVENTS=false SHOW_GUI=false DURATION=20 ./scripts/run.sh
 
-# Select a camera by SDK serial number or device index (default: 0)
-CAMERA_SERIAL=YOUR_SERIAL ./scripts/run.sh
+# Select a camera or override the window duration
 CAMERA_INDEX=1 ./scripts/run.sh
+WINDOW_MS=250 ./scripts/run.sh
 
-# Set the target display rate (actual rate depends on event load and Python processing)
-./scripts/run.sh image_fps:=15
-
-# Rebuild after changing package source code
-./scripts/build.sh
+# Roll back the result thread, retaining the 250 ms window
+E2FAI_RESULT_MODE=inline ./scripts/run.sh
 ```
 
-USB access uses `/dev/bus/usb` and a USB device cgroup rule. The script temporarily grants the root container X11 access and revokes it on exit. ROS uses host networking with localhost defaults; stop other ROS demos using the same node names before starting.
-
-## Data flow and nodes
+## Data path and outputs
 
 ```mermaid
-flowchart TD
-    Camera[NRV DELTA01 USB] --> Driver
-    subgraph Manager[delta_manager process]
-      Driver[delta_driver · Official DriverNodelet]
-      Adapter[dvs/event_adapter · Demo adapter]
-      Renderer[delta_renderer · Official RendererNodelet]
-      Driver -->|/delta_driver/events · EventPacket| Adapter
-      Driver -->|/delta_driver/events · EventPacket| Renderer
-    end
-    Driver -->|RAW bytes and metadata| Python[nrv_python_demo · Python process]
-    Adapter -->|/dvs/events · EventArray| Python
-    Renderer -->|/delta_renderer/image| GUI[nrv_gui · Controls and two views]
-    Renderer -->|Received image count| Python
-    Python -->|/nrv_python_demo/image| GUI
-    GUI -->|/nrv_noise parameters| Python
-    GUI -. Apply and restart .-> Manager
+flowchart LR
+  Camera[DELTA01] --> Driver[Official driver]
+  Driver -->|RAW| Renderer[Official renderer]
+  Driver -->|RAW| Adapter[Event decoder]
+  Driver -->|RAW| Monitor[Capture counters]
+  Adapter -->|/dvs/events| Bridge[C++ ROS bridge]
+  Bridge <-->|Local TCP| Model[Host GPU E2FAI]
+  Renderer --> GUI[Qt 1–3 views]
+  Bridge -->|/nrv_e2fai/result| GUI
+  Monitor -->|/nrv_capture/status| GUI
 ```
 
-`roslaunch` starts `roscore` when needed. The driver, adapter, and renderer share a nodelet manager; Python and the GUI run as separate processes. The GUI owns a child roslaunch for the capture pipeline; its own ROS master remains available during restarts.
+Driver, decoder, and renderer share the nodelet manager. Capture counters, the C++ bridge, and Qt are separate processes. TCP defaults to `127.0.0.1:8765`. Qt caches the latest images and does not wait for inference.
 
-| Topic | ROS message | Content |
-| --- | --- | --- |
-| `/delta_driver/events` | `event_camera_msgs/EventPacket` | Official RAW encoded payload, sequence number, encoding, timing metadata, width, and height |
-| `/dvs/events` | `dvs_msgs/EventArray` | Decoded `(x, y, ts, polarity)` event arrays |
-| `/dvs/camera_info` | `sensor_msgs/CameraInfo` | Camera information; no calibration parameters are supplied, and the centroid algorithm does not require them |
-| `/delta_renderer/image` | `sensor_msgs/Image` | Official rendered image |
-| `/nrv_python_demo/image` | `sensor_msgs/Image`, `bgr8` | Python algorithm image |
-
-The two image paths accumulate events independently, so their display windows are not strictly synchronized. The default target image rate is 10 Hz; the RAW subscription does not subsample events based on the display rate.
-
-## Receiving RAW data in your algorithm
-
-With the demo running, open another terminal in the repository directory:
-
-```bash
-docker compose run --rm nrv-demo python3 /examples/raw_receiver.py
-```
-
-[examples/raw_receiver.py](examples/raw_receiver.py) is a minimal Python receiver you can modify directly. Its core interface is:
-
-```python
-from event_camera_msgs.msg import EventPacket
-
-def on_raw(msg):
-    payload = memoryview(msg.events)
-    # Call your algorithm here with the payload and required metadata.
-
-subscriber = rospy.Subscriber("/delta_driver/events", EventPacket, on_raw,
-                              queue_size=100, buff_size=16 * 1024 * 1024)
-```
-
-The `examples/` directory is mounted read-only inside the container. Edit the receiver on the host and rerun it; no image rebuild is needed. The container entrypoint already sources ROS and the workspace. For an interactive shell, run `docker compose run --rm nrv-demo bash`.
-
-**What RAW means here:** `msg.events` is a `uint8[]` encoded payload, received as bytes in rospy. The current driver uses `group_aer`. This is neither an array of decoded event coordinates nor a complete `.dvs` file. Algorithms requiring `.dvs` files need a separate file-recording interface.
-
-When forwarding the payload, retain `encoding`, `seq`, `time_base`, `header`, `width`, `height`, and `is_bigendian`. The `group_aer` decoder maintains state across packets. Interpret timing according to the encoding; the packet header timestamp is not the timestamp of every event.
-
-If your algorithm needs `(x,y,t,p)`, subscribe to `/dvs/events` and refer to `on_events()` in [demo.py](ros_ws/src/nrv_demo/scripts/demo.py). `event.ts` is the ROS time mapped by the adapter, and `polarity=True` means ON. Replace the processing in `publish_algorithm_image()` and continue publishing `sensor_msgs/Image` to reuse the algorithm-view window.
-
-## Checking the pipeline
-
-The terminal reports RAW packet count, byte count, throughput, sequence discontinuities, decoded event count, and both image counts once per second.
-
-A final `PASS` in dual-view mode requires:
-
-1. Python received a nonempty RAW payload.
-2. RAW `seq` values remained consecutive from the first received packet.
-3. Python received decoded events and official renderer images.
-4. Python published algorithm images.
-
-RAW-only mode checks only the first two conditions. `summary.json` records the counts and individual checks. The script returns `0` for `PASS` and `1` for `FAIL`. In a timed run, the Python node's normal exit shuts down the launch group. The ROS message `REQUIRED process ... has died! / process has finished cleanly` reflects this shutdown mechanism.
-
-These checks establish connectivity. Consecutive packet numbers do not prove that no events were lost inside the camera, and the checks do not verify window visibility. Python event-object deserialization and algorithm load can cause the decoded path to fall behind or drop messages; measure your algorithm at the intended event rate. Use RAW-only mode when your algorithm only needs encoded data.
-
-| Symptom | Action |
+| Topic | Content |
 | --- | --- |
-| No RAW packets | Check for USB device `04b4:00f1`, confirm the camera is not in use elsewhere, and check the serial/index and driver logs |
-| RAW arrives but decoded events are scarce or absent | Create motion in front of the lens; inspect adapter logs and the RAW encoding |
-| RAW sequence discontinuities | Check driver/receiver load and retry in RAW-only mode; avoid excessive logging or blocking I/O in callbacks |
-| Image counts increase but no windows appear | Check `DISPLAY` and `xhost` in a desktop terminal; use `SHOW_GUI=false` without a desktop |
-| Package algorithm changes have no effect | Rebuild with `./scripts/build.sh`; scripts under `examples/` do not require rebuilding |
+| `/delta_driver/events` | `event_camera_msgs/EventPacket`: RAW payload and metadata |
+| `/dvs/events` | `dvs_msgs/EventArray`: ordered `(x, y, ts, polarity)` |
+| `/delta_renderer/image` | Official event rendering |
+| `/nrv_e2fai/result` | Session/window/source-batch metadata, `mono8` reconstruction, `rgb8` flow preview, `32FC2` flow |
+| `/nrv_e2fai/status` | Bridge connection/pause state and counters |
+| `/nrv_capture/status` | RAW packet count, byte rate, sequence-discontinuity count |
 
-## Contents and dependencies
+Results are saved under `output/run_*/`. `summary.json` checks RAW reception and sequence continuity only; `raw_sequence_gaps` counts discontinuity incidents. Model and bridge records are `e2fai_session_*.json` and `sessions/<session>/bridge_summary.json`. `integration_summary.json` checks RAW capture, model results, session errors, and ROS batch discontinuities; valid time resets are recorded without automatically failing the run. PASS does not establish real-time performance. `PERF_ENABLED=true` additionally writes periodic `performance_*.jsonl`. GUI timing ends at `setPixmap`, not physical monitor presentation.
 
-```text
-compose.yaml                         Container runtime configuration
-docker/                              Standalone image and entrypoint
-scripts/build.sh, scripts/run.sh      Build and one-command launch
-examples/raw_receiver.py              Minimal algorithm integration example
-ros_ws/src/nrv_demo/                  Python demo, adapter, and complete launch
-ros_ws/src/dvs_msgs/                  Event / EventArray messages and original license
-output/                              Local results; excluded from Git and build context
-```
+Current results are in [E2FAI 250 ms and result-thread measurements](docs/E2FAI250ms与结果线程实测.md), delivered as Markdown. [Earlier fixes and short camera checks](docs/E2FAI修复与真机短测.md) and the [migration report](docs/移植后性能测试与瓶颈分析.md) remain as historical records; results using earlier window durations or bridge implementations do not represent the current build.
 
-Pinned dependencies: Ubuntu 20.04, ROS Noetic, `libdelta-sdk=1.2.2-1~ubuntu20.04`, `ros-noetic-delta-driver/tools=1.2.0-0focal`, `event-camera-msgs=2.0.1-0focal`, and `event-camera-codecs=1.0.0-0focal`. The first build requires access to the Ubuntu, ROS, and [NRV package repositories](https://nrvcorp.github.io/camera/apt/ubuntu20.04/). This repository contains no vendor binaries or recordings, and the image does not install the vendor Viewer.
+[examples/raw_receiver.py](examples/raw_receiver.py) remains an independent RAW receiver example and does not run in the demo pipeline. `group_aer` is encoded data with cross-packet state, not a complete `.dvs` file; retain encoding, sequence, time base, dimensions, and other metadata when forwarding it.
 
-The code was extracted from the NRV example in [event-camera-lab](https://github.com/lixiang-moss/event-camera-lab). The two `dvs_msgs` definitions come from [rpg_dvs_ros](https://github.com/uzh-rpg/rpg_dvs_ros), with their MIT license retained. The NRV SDK, driver, and codecs remain subject to their respective licenses. This repository's example code is licensed under [MIT](LICENSE).
+The image uses Ubuntu 20.04, ROS Noetic, and the NRV SDK/driver packages. Rebuild with `./scripts/build.sh` after changing container source. USB is exposed through `/dev/bus/usb`; the launcher temporarily grants container X11 access and revokes it at exit. Example code is [MIT licensed](LICENSE); vendor dependencies and `dvs_msgs` retain their own licenses.

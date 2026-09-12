@@ -1,0 +1,93 @@
+--- a/opt/ros/noetic/include/event_camera_codecs/group_aer_decoder.h
++++ b/opt/ros/noetic/include/event_camera_codecs/group_aer_decoder.h
+@@ -182,9 +182,10 @@
+   // alone does not tell us where in the image the following groups belong.
+   enum class State { WaitFrameEnd, WaitOrigin, Running };
+ 
+-  static constexpr double kSubPeriodUs = 1.0;
+-  static constexpr double kRefPeriodUs = 1000.0;
++  static constexpr uint64_t kSubPeriodUs = 1;
++  static constexpr uint64_t kRefPeriodUs = 1000;
+   static constexpr uint32_t kRefMax = 0x3FFFFF;
++  static constexpr uint64_t kReferencePeriodUs = (uint64_t{kRefMax} + 1) * kRefPeriodUs;
+ 
+   static size_t popCount(uint8_t v)
+   {
+@@ -196,13 +197,13 @@
+     return (n);
+   }
+ 
+-  static uint32_t composeUs(uint32_t refTS, uint32_t subTS)
+-  {
+-    const double us = refTS * kRefPeriodUs + subTS * kSubPeriodUs;
+-    return (static_cast<uint32_t>(static_cast<uint64_t>(us + 0.5) & 0xFFFFFFFFULL));
+-  }
+-
+-  // Absolute sensor time, accumulated across the 32-bit microsecond rollover.
++  static uint64_t composeUs(uint32_t refTS, uint32_t subTS)
++  {
++    return (uint64_t{refTS} * kRefPeriodUs + uint64_t{subTS} * kSubPeriodUs);
++  }
++
++  // Sensor time, extended only at an observed 22-bit reference wrap boundary.
++  // Explicit non-boundary reference regressions remain visible clock resets.
+   uint64_t sensorTime() const { return ((wrapAccumUs_ + fullTS_) * timeMult_); }
+ 
+   void applyColumnWord(const uint8_t * w)
+@@ -216,23 +217,35 @@
+     if (w[1] & 0x80) {
+       const uint32_t subTS =
+         (static_cast<uint32_t>(w[2] & 0x03) << 8) | static_cast<uint32_t>(w[3]);
+-      uint32_t newTs = composeUs(refTS_, subTS);
+-      // The reference word is not resent on every tick, so a sub timestamp that
+-      // fails to advance means the reference counter rolled over.
+-      if (newTs <= fullTS_) {
+-        if (lastRefTS_ == refTS_) {
+-          refTS_ = (refTS_ >= kRefMax) ? 0 : (refTS_ + 1);
++      uint64_t newTs = composeUs(refTS_, subTS);
++      // Repeated sub words are valid and must be idempotent. Infer the next
++      // reference tick only if no explicit reference accompanied this sub word.
++      if (!explicitRefPending_ && newTs < fullTS_ && lastRefTS_ == refTS_) {
++        if (refTS_ == kRefMax) {
++          refTS_ = 0;
++          wrapAccumUs_ += kReferencePeriodUs;
++        } else {
++          ++refTS_;
+         }
+         newTs = composeUs(refTS_, subTS);
+-      }
+-      if (newTs < fullTS_) {
+-        wrapAccumUs_ += (1ULL << 32);
+       }
+       fullTS_ = newTs;
+       lastRefTS_ = refTS_;
++      explicitRefPending_ = false;
+     } else {
+-      refTS_ = (static_cast<uint32_t>(w[1] & 0x3F) << 16) |
+-               (static_cast<uint32_t>(w[2]) << 8) | static_cast<uint32_t>(w[3]);
++      const uint32_t nextRef = (static_cast<uint32_t>(w[1] & 0x3F) << 16) |
++        (static_cast<uint32_t>(w[2]) << 8) | static_cast<uint32_t>(w[3]);
++      if (haveOrigin_ && nextRef < refTS_) {
++        if (refTS_ == kRefMax && nextRef == 0) {
++          wrapAccumUs_ += kReferencePeriodUs;
++        } else {
++          // A smaller explicitly supplied reference is not evidence of a full
++          // clock rollover. Preserve the reset instead of inventing 4295 s.
++          wrapAccumUs_ = 0;
++        }
++      }
++      refTS_ = nextRef;
++      explicitRefPending_ = true;
+       if (state_ == State::WaitOrigin && !haveOrigin_) {
+         fullTS_ = composeUs(refTS_, 0);
+         lastRefTS_ = refTS_;
+@@ -326,7 +339,8 @@
+   bool mirrorFlag_{false};
+   uint32_t refTS_{0};
+   uint32_t lastRefTS_{0};
+-  uint32_t fullTS_{0};
++  uint64_t fullTS_{0};
++  bool explicitRefPending_{false};
+   uint64_t wrapAccumUs_{0};
+   uint32_t timeMult_{1000};
+ };

@@ -8,17 +8,24 @@ import signal
 import sys
 import threading
 import time
+import uuid
 
 import rospy
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
+from nrv_demo.msg import E2faiResult
 from PyQt5 import QtCore, QtGui, QtWidgets as Q
+from performance import PerfRecorder
+
+
+VIEW_SOURCES = [('raw', 'Original rendering'),
+                ('e2fai_gray', 'E2FAI reconstruction'), ('e2fai_flow', 'E2FAI optical flow')]
 
 
 class NoiseWindow(Q.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('NRV Demo — Camera & Noise Controls')
+        self.setWindowTitle('NRV Demo — E2FAI')
         self.resize(1420, 820)
         self.lock = threading.Lock()
         self.frames = {}
@@ -27,8 +34,14 @@ class NoiseWindow(Q.QMainWindow):
         self.restart_pending = False
         self.closing = False
         self.stopping = False
+        self.session_id = None
+        self.latest_model_status = None
+        self.e2fai_enabled = rospy.get_param('~e2fai_enabled', True)
         self.output = Path(rospy.get_param('~output_dir'))
         self.output.mkdir(parents=True, exist_ok=True)
+        self.perf = PerfRecorder(self.output, 'gui', enabled=rospy.get_param('~perf_enabled', False),
+                                 interval_s=rospy.get_param('~perf_interval_s', 5.0),
+                                 capacity=rospy.get_param('~perf_capacity', 4096))
         self.profile_path = Path(rospy.get_param('~profile_path', '/output/last_applied_parameters.json'))
         self.sensor_text = Path(rospy.get_param('~sensor_setting_path')).read_text()
         self.process = QtCore.QProcess(self)
@@ -48,9 +61,21 @@ class NoiseWindow(Q.QMainWindow):
         for widget in (self.start_button, self.stop_button, self.state):
             bar.addWidget(widget)
         bar.addStretch()
+        self.views_button = Q.QToolButton()
+        self.views_button.setText('Views (3)')
+        self.views_button.setPopupMode(Q.QToolButton.InstantPopup)
+        self.views_menu = Q.QMenu(self.views_button)
+        self.views_button.setMenu(self.views_menu)
+        self.view_actions = {}
+        for key, title in VIEW_SOURCES:
+            action = self.views_menu.addAction(title)
+            action.setCheckable(True)
+            action.setChecked(True)
+            self.view_actions[key] = action
+        bar.addWidget(self.views_button)
         self.settings_button = Q.QPushButton('Settings')
         self.settings_button.setCheckable(True)
-        self.settings_button.setToolTip('Show or hide camera and noise parameters')
+        self.settings_button.setToolTip('Show or hide camera parameters')
         bar.addWidget(self.settings_button)
         layout.addLayout(bar)
         body = Q.QHBoxLayout()
@@ -76,26 +101,6 @@ class NoiseWindow(Q.QMainWindow):
         note.setWordWrap(True)
         form.addRow(note)
         panel.addWidget(hardware)
-        software = Q.QGroupBox('Software filters')
-        form = Q.QFormLayout(software)
-        self.background = Q.QCheckBox('Neighbour filter')
-        self.window = Q.QDoubleSpinBox()
-        self.window.setRange(0.1, 100)
-        self.window.setValue(5)
-        self.window.setSuffix(' ms')
-        self.refractory = Q.QCheckBox('Pixel interval filter')
-        self.interval = Q.QDoubleSpinBox()
-        self.interval.setRange(0.1, 100)
-        self.interval.setValue(1)
-        self.interval.setSuffix(' ms')
-        form.addRow(self.background)
-        form.addRow('Neighbour window', self.window)
-        form.addRow(self.refractory)
-        form.addRow('Minimum interval', self.interval)
-        note = Q.QLabel('Left: original. Right: filtered events + centroid.\nSoftware filters leave the RAW topic unchanged.')
-        note.setWordWrap(True)
-        form.addRow(note)
-        panel.addWidget(software)
         self.apply_button = Q.QPushButton('Apply parameters')
         self.apply_button.setToolTip('Apply all edits. Camera bias changes restart acquisition.')
         self.apply_button.clicked.connect(self.apply_parameters)
@@ -111,18 +116,30 @@ class NoiseWindow(Q.QMainWindow):
         panel.addStretch()
         body.addWidget(controls)
         self.views = {}
-        for key, title in [('raw', 'Original rendering'), ('algorithm', 'Filtered + centroid')]:
-            column = Q.QVBoxLayout()
+        self.view_panels = {}
+        self.view_grid = Q.QGridLayout()
+        body.addLayout(self.view_grid, 1)
+        for key, title in VIEW_SOURCES:
+            container = Q.QWidget()
+            column = Q.QVBoxLayout(container)
             column.addWidget(Q.QLabel(title))
             view = Q.QLabel('Waiting for camera data')
             view.setAlignment(QtCore.Qt.AlignCenter)
             view.setMinimumSize(320, 240)
             view.setStyleSheet('background:#111827;color:#cbd5e1;border:1px solid #334155;')
             column.addWidget(view, 1)
-            body.addLayout(column, 1)
             self.views[key] = view
-        self.metrics = Q.QLabel('Events/s: —   Retained: —   RAW gaps: —')
+            self.view_panels[key] = container
+        self.relayout_views()
+        # Set after parenting/styling: pixmaps must not become layout size hints.
+        for view in self.views.values():
+            view.setSizePolicy(Q.QSizePolicy.Ignored, Q.QSizePolicy.Ignored)
+        for action in self.view_actions.values():
+            action.toggled.connect(self.change_views)
+        self.metrics = Q.QLabel('RAW: — MB/s   Packets: —   RAW gaps: —')
         layout.addWidget(self.metrics)
+        self.model_status = Q.QLabel('E2FAI: waiting for connection' if self.e2fai_enabled else 'E2FAI: disabled')
+        layout.addWidget(self.model_status)
         self.log = Q.QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(130)
@@ -130,8 +147,10 @@ class NoiseWindow(Q.QMainWindow):
         layout.addWidget(self.log)
         self.subscribers = [
             rospy.Subscriber('/delta_renderer/image', Image, self.on_image, callback_args='raw', queue_size=1),
-            rospy.Subscriber('/nrv_python_demo/image', Image, self.on_image, callback_args='algorithm', queue_size=1),
-            rospy.Subscriber('/nrv_python_demo/status', String, self.on_status, queue_size=1),
+            rospy.Subscriber('/nrv_capture/status', String, self.on_status, queue_size=1),
+            rospy.Subscriber('/nrv_e2fai/result', E2faiResult, self.on_model_result,
+                             queue_size=1, buff_size=64 * 1024 * 1024),
+            rospy.Subscriber('/nrv_e2fai/status', String, self.on_model_status, queue_size=1),
         ]
         if self.profile_path.exists():
             try:
@@ -139,34 +158,58 @@ class NoiseWindow(Q.QMainWindow):
                 self.log.appendPlainText('Restored last applied parameters.')
             except (OSError, ValueError, KeyError, TypeError) as error:
                 self.log.appendPlainText('Could not restore saved parameters: ' + str(error))
+        requested_views = rospy.get_param('~visible_views', [])
+        if requested_views:
+            self.set_profile(dict(bias=self.bias_values(), views=requested_views))
         self.active_bias = self.bias_values()
-        self.active_filters = self.filter_values()
-        for control in (self.background, self.refractory):
-            control.toggled.connect(self.update_pending)
-        for control in (self.window, self.interval, *self.bias.values()):
+        for control in self.bias.values():
             control.valueChanged.connect(self.update_pending)
         self.update_pending()
-        self.update_filters()
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(100)
-        QtCore.QTimer.singleShot(0, self.start)
+        if rospy.get_param('~auto_start', True):
+            QtCore.QTimer.singleShot(0, self.start)
 
     def bias_values(self):
         return {address: widget.value() for address, widget in self.bias.items()}
 
-    def filter_values(self):
-        return dict(background=self.background.isChecked(), window_ms=self.window.value(),
-                    refractory=self.refractory.isChecked(), interval_ms=self.interval.value())
+    def visible_views(self):
+        return [key for key, _ in VIEW_SOURCES if self.view_actions[key].isChecked()]
+
+    def relayout_views(self):
+        while self.view_grid.count():
+            self.view_grid.takeAt(0)
+        visible = self.visible_views()
+        for key, panel in self.view_panels.items():
+            panel.setVisible(key in visible)
+        for index, key in enumerate(visible):
+            row, column = (0, index) if len(visible) < 3 else divmod(index, 2)
+            self.view_grid.addWidget(self.view_panels[key], row, column)
+        for key, action in self.view_actions.items():
+            action.setEnabled(len(visible) > 1 or key not in visible)
+        self.views_button.setText('Views ({})'.format(len(visible)))
+
+    def change_views(self):
+        if not self.visible_views():
+            action = self.view_actions['raw']
+            action.blockSignals(True)
+            action.setChecked(True)
+            action.blockSignals(False)
+        self.relayout_views()
+        if hasattr(self, 'active_bias'):
+            self.persist_applied_profile()
+
+    def persist_applied_profile(self):
+        self.profile_path.parent.mkdir(parents=True, exist_ok=True)
+        self.profile_path.write_text(json.dumps(dict(bias=self.active_bias,
+                                                     views=self.visible_views()), indent=2) + '\n')
 
     def update_pending(self):
-        pending = self.bias_values() != self.active_bias or self.filter_values() != self.active_filters
+        pending = self.bias_values() != self.active_bias
         self.apply_button.setEnabled(pending)
         self.parameter_status.setText('Pending changes — click Apply parameters' if pending else 'Parameters applied')
         self.parameter_status.setWordWrap(True)
-
-    def update_filters(self):
-        rospy.set_param('/nrv_noise', self.active_filters)
 
     def write_settings(self):
         text = self.sensor_text
@@ -183,17 +226,26 @@ class NoiseWindow(Q.QMainWindow):
             return
         self.stopping = False
         settings = self.write_settings()
-        args = ['nrv_demo', 'demo.launch', 'show_gui:=false', 'sensor_setting_path:=' + str(settings)]
+        self.session_id = uuid.uuid4().hex
+        args = ['nrv_demo', 'demo.launch', 'show_gui:=false', 'sensor_setting_path:=' + str(settings),
+                'session_id:=' + self.session_id]
         for name in ('serial_number', 'device_index', 'duration', 'output_dir', 'message_threshold_time_ms', 'image_fps'):
             args.append(name + ':=' + str(rospy.get_param('~' + name)))
+        for name, default in (('e2fai_enabled', True), ('e2fai_host', '127.0.0.1'),
+                              ('e2fai_port', 8765), ('perf_enabled', False), ('start_driver', True),
+                              ('perf_interval_s', 5.0), ('perf_capacity', 4096)):
+            value = rospy.get_param('~' + name, default)
+            args.append(name + ':=' + (str(value).lower() if isinstance(value, bool) else str(value)))
         with self.lock:
             self.frames.clear()
             self.latest_status = None
+            self.latest_model_status = None
             self.last_frame = 0
         for view in self.views.values():
             view.clear()
             view.setText('Waiting for camera data')
-        self.metrics.setText('Events/s: —   Retained: —   RAW gaps: —')
+        self.metrics.setText('RAW: — MB/s   Packets: —   RAW gaps: —')
+        self.model_status.setText('E2FAI: connecting' if self.e2fai_enabled else 'E2FAI: disabled')
         self.process.start('roslaunch', args)
         self.state.setText('Starting')
         self.start_button.setEnabled(False)
@@ -203,19 +255,29 @@ class NoiseWindow(Q.QMainWindow):
         self.interrupt()
 
     def interrupt(self):
-        if self.process.state() == QtCore.QProcess.Running:
+        # Stop accepting in-flight results before acquisition termination completes.
+        with self.lock:
+            self.session_id = None
+            self.latest_model_status = None
+            for key in ('e2fai_gray', 'e2fai_flow'):
+                self.frames.pop(key, None)
+        self.model_status.setText('E2FAI: acquisition stopped' if self.e2fai_enabled else 'E2FAI: disabled')
+        if self.process.state() != QtCore.QProcess.NotRunning:
             self.stopping = True
             self.state.setText('Stopping')
-            os.kill(int(self.process.processId()), signal.SIGINT)
+            if self.process.processId():
+                try:
+                    os.kill(int(self.process.processId()), signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+            else:
+                QtCore.QTimer.singleShot(50, self.interrupt)
 
     def apply_parameters(self):
         bias_changed = self.bias_values() != self.active_bias
         self.active_bias = self.bias_values()
-        self.active_filters = self.filter_values()
-        self.update_filters()
         self.write_settings()
-        self.profile_path.parent.mkdir(parents=True, exist_ok=True)
-        self.profile_path.write_text(json.dumps(dict(bias=self.active_bias, filters=self.active_filters), indent=2) + '\n')
+        self.persist_applied_profile()
         self.update_pending()
         if bias_changed and self.process.state() != QtCore.QProcess.NotRunning:
             self.log.appendPlainText('Applying camera parameters: restarting acquisition.')
@@ -225,9 +287,17 @@ class NoiseWindow(Q.QMainWindow):
             self.log.appendPlainText('Parameters applied.')
 
     def finished(self, *_):
+        with self.lock:
+            self.session_id = None
+            self.latest_model_status = None
+            for key in ('e2fai_gray', 'e2fai_flow'):
+                self.frames.pop(key, None)
+        self.model_status.setText('E2FAI: acquisition stopped' if self.e2fai_enabled else 'E2FAI: disabled')
         self.state.setText('Stopped')
         self.start_button.setEnabled(True)
-        if self.restart_pending and not self.closing:
+        if self.closing:
+            QtCore.QTimer.singleShot(0, self.close)
+        elif self.restart_pending:
             self.restart_pending = False
             QtCore.QTimer.singleShot(0, self.start)
 
@@ -239,22 +309,63 @@ class NoiseWindow(Q.QMainWindow):
 
     def on_image(self, message, key):
         with self.lock:
-            self.frames[key] = message
+            if key in self.frames:
+                self.perf.increment('latest_frame_overwrites_' + key)
+            self.frames[key] = (message, self.perf.tick(), {})
             self.last_frame = time.monotonic()
 
     def on_status(self, message):
+        try:
+            status = json.loads(message.data)
+        except (ValueError, TypeError):
+            return
         with self.lock:
-            self.latest_status = json.loads(message.data)
+            self.latest_status = status
+
+    def on_model_result(self, message):
+        received = self.perf.tick()
+        with self.lock:
+            if self.session_id is None or message.session_id != self.session_id:
+                self.perf.increment('stale_session_results')
+                return
+            if 'e2fai_gray' in self.frames or 'e2fai_flow' in self.frames:
+                self.perf.increment('latest_result_overwrites')
+            metadata = dict(window_id=message.window_id, source_callback_ns=message.source_callback_ns,
+                            window_end_ns=message.window_end_ns)
+            self.frames['e2fai_gray'] = (message.gray, received, metadata)
+            self.frames['e2fai_flow'] = (message.flow_preview, received, metadata)
+
+    def on_model_status(self, message):
+        try:
+            status = json.loads(message.data)
+        except (ValueError, TypeError):
+            return
+        with self.lock:
+            if self.session_id is not None and status.get('session_id') == self.session_id:
+                self.latest_model_status = status
 
     def refresh(self):
+        if self.perf.enabled:
+            refresh_ns = self.perf.tick()
+            previous_refresh = getattr(self, '_previous_refresh_ns', None)
+            if previous_refresh is not None:
+                interval_ms = (refresh_ns - previous_refresh) / 1e6
+                self.perf.observe('refresh_interval', interval_ms)
+                self.perf.observe('refresh_timer_lateness', max(0, interval_ms - 100))
+            self._previous_refresh_ns = refresh_ns
         if rospy.is_shutdown():
             self.close()
             return
         with self.lock:
             frames, self.frames = self.frames, {}
             status = self.latest_status
+            model_status = self.latest_model_status
             last = self.last_frame
-        for key, message in frames.items():
+        for key, (message, received, metadata) in frames.items():
+            if not self.view_actions[key].isChecked():
+                continue
+            self.perf.elapsed('receive_to_refresh', received, source=key, **metadata)
+            tick = self.perf.tick()
             formats = {'bgr8': QtGui.QImage.Format_RGB888, 'rgb8': QtGui.QImage.Format_RGB888,
                        'mono8': QtGui.QImage.Format_Grayscale8}
             if message.encoding not in formats:
@@ -265,31 +376,60 @@ class NoiseWindow(Q.QMainWindow):
             if message.encoding == 'bgr8':
                 image = image.rgbSwapped()
             view = self.views[key]
-            view.setPixmap(QtGui.QPixmap.fromImage(image).scaled(view.size(), QtCore.Qt.KeepAspectRatio,
+            view.setPixmap(QtGui.QPixmap.fromImage(image).scaled(view.contentsRect().size(), QtCore.Qt.KeepAspectRatio,
                                                                 QtCore.Qt.SmoothTransformation))
+            self.perf.elapsed('image_convert_scale_setpixmap', tick, source=key, **metadata)
+            self.perf.increment('presentations_' + key)
+            if self.perf.enabled and metadata.get('source_callback_ns'):
+                self.perf.observe('callback_to_setpixmap',
+                                  (time.monotonic_ns() - metadata['source_callback_ns']) / 1e6,
+                                  source=key, window_id=metadata['window_id'])
+                # A mapped-time proxy can be negative when the decoder clock
+                # jumps into the future; it is never physical sensor latency.
+                self.perf.observe('mapped_window_age_at_setpixmap',
+                                  (rospy.Time.now().to_nsec() - metadata['window_end_ns']) / 1e6,
+                                  source=key, window_id=metadata['window_id'])
+        if model_status:
+            text = 'E2FAI: {}   Results: {}   Queue: {}'.format(
+                model_status['state'], model_status['results'], model_status['queue_batches'])
+            if model_status.get('detail'):
+                text += '   ' + model_status['detail']
+            self.model_status.setText(text)
         if self.process.state() == QtCore.QProcess.Running and not self.stopping:
             self.state.setText('Streaming' if last and time.monotonic() - last < 2 else
                                'Waiting for data (check the camera and log below)')
         if status:
-            total = status['decoded_events']
-            retained = 100 * status['filtered_events'] / total if total else 0
-            self.metrics.setText('Events/s: {:,.0f}   Retained (session): {:.1f}%   RAW gaps: {}'.format(
-                status['events_per_second'], retained, status['raw_sequence_gaps']))
+            self.metrics.setText('RAW: {:.2f} MB/s   Packets: {:,}   RAW gaps: {}'.format(
+                status['bytes_per_second'] / 1e6, status['raw_packets'], status['raw_sequence_gaps']))
 
     def save_profile(self):
-        path, _ = Q.QFileDialog.getSaveFileName(self, 'Save profile', str(self.output / 'noise_profile.json'), 'JSON (*.json)')
+        path, _ = Q.QFileDialog.getSaveFileName(self, 'Save profile', str(self.output / 'camera_profile.json'), 'JSON (*.json)')
         if path:
             Path(path).write_text(json.dumps(dict(bias={a: w.value() for a, w in self.bias.items()},
-                                               filters=self.filter_values()), indent=2) + '\n')
+                                               views=self.visible_views()), indent=2) + '\n')
 
     def set_profile(self, config):
+        if not isinstance(config, dict):
+            raise ValueError('Profile must be a JSON object')
+        visible = config.get('views', [key for key, _ in VIEW_SOURCES])
+        if not isinstance(visible, list) or any(not isinstance(key, str) for key in visible):
+            raise ValueError('views must be a list of image sources')
+        # Profiles from the centroid demo still load; its removed view/filter
+        # settings cannot affect E2FAI input or the current layout.
+        visible = [key for key in visible if key != 'algorithm']
+        if not visible:
+            visible = [key for key, _ in VIEW_SOURCES]
+        if (any(key not in self.view_actions for key in visible) or len(set(visible)) != len(visible)):
+            raise ValueError('views must contain one to three distinct known image sources')
         for address, widget in self.bias.items():
             widget.setValue(config['bias'][address])
-        filters = config['filters']
-        self.background.setChecked(filters['background'])
-        self.window.setValue(filters['window_ms'])
-        self.refractory.setChecked(filters['refractory'])
-        self.interval.setValue(filters['interval_ms'])
+        for key, action in self.view_actions.items():
+            action.blockSignals(True)
+            action.setChecked(key in visible)
+            action.blockSignals(False)
+        self.relayout_views()
+        if hasattr(self, 'active_bias'):
+            self.persist_applied_profile()
 
     def load_profile(self):
         path, _ = Q.QFileDialog.getOpenFileName(self, 'Load profile', '/output', 'JSON (*.json)')
@@ -306,11 +446,14 @@ class NoiseWindow(Q.QMainWindow):
         self.closing = True
         self.stop()
         if self.process.state() != QtCore.QProcess.NotRunning:
-            self.process.waitForFinished(20000)
-        if self.process.state() != QtCore.QProcess.NotRunning:
-            self.closing = False
+            self.state.setText('Closing — waiting for acquisition to stop')
+            self.setEnabled(False)
             event.ignore()
             return
+        self.timer.stop()
+        for subscriber in self.subscribers:
+            subscriber.unregister()
+        self.perf.close()
         event.accept()
 
 
