@@ -1,0 +1,7 @@
+Host /proc/self/timens_offsets:
+monotonic 0 0
+boottime 0 0
+Docker nrv-demo:noetic /proc/self/timens_offsets:
+monotonic 0 0
+boottime 0 0
+Both use the same Linux kernel CLOCK_MONOTONIC with zero namespace offsets.

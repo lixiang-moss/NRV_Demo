@@ -24,7 +24,7 @@ class ProtocolError(ValueError):
 
 
 def send_packet(connection, kind, metadata, payload=b""):
-    if kind not in ("events", "result", "error") or not isinstance(metadata, dict):
+    if kind not in ("events", "result", "error", "status") or not isinstance(metadata, dict):
         raise ProtocolError("Invalid packet kind or metadata")
     encoded = json.dumps({"kind": kind, "meta": metadata},
                          separators=(",", ":"), allow_nan=False).encode("utf-8")
@@ -70,7 +70,7 @@ def recv_packet(connection):
     except (ValueError, UnicodeError) as error:
         raise ProtocolError("Invalid metadata JSON") from error
     if (not isinstance(envelope, dict)
-            or envelope.get("kind") not in ("events", "result", "error")
+            or envelope.get("kind") not in ("events", "result", "error", "status")
             or not isinstance(envelope.get("meta"), dict)):
         raise ProtocolError("Invalid packet metadata")
     return envelope["kind"], envelope["meta"], _read_exact(connection, payload_size)

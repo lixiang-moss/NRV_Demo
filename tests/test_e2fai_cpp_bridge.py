@@ -113,6 +113,15 @@ def run_probe():
             assert bytes(result.flow.data) == flow and result.flow.encoding == "32FC2"
             assert not result.flow.is_bigendian and result.flow.step == 16
 
+            send_packet(connection, 'status', dict(session_id='interop-session', state='catching_up',
+                        processing_generation=1, reason='queue_freshness'))
+            wait_for(lambda: any(s['state'] == 'catching_up' for s in statuses), 'catch-up status')
+            # Old generation must be ignored even if its TCP packet is complete.
+            send_packet(connection, 'result', output_meta, gray + color + flow)
+            send_packet(connection, 'result', dict(output_meta, window_id=8, processing_generation=1), gray + color + flow)
+            wait_for(lambda: len(results) >= 2, 'fresh-generation result')
+            assert [r.window_id for r in results] == [7, 8], results
+
             send_packet(connection, "error", dict(session_id="interop-session", code="probe_stop", message="test pause"))
             wait_for(lambda: any(status["state"] == "paused" for status in statuses), "worker error pause")
             process.send_signal(signal.SIGINT)
@@ -121,11 +130,53 @@ def run_probe():
             summary = json.loads((output / "bridge_summary.json").read_text())
             assert summary["worker_errors"] == 1 and summary["local_errors"] == 0, summary
             assert summary["error_code"] == "probe_stop" and summary["stop_reason"] == "failure", summary
-            assert summary["batches"] == 1 and summary["results"] == 1, summary
+            assert summary["batches"] == 1 and summary["results"] == 2, summary
             assert not list(output.glob("performance_*.jsonl")), "Disabled measurement wrote a file"
             print("CPP_BRIDGE_INTEROP " + json.dumps({"status": "PASS", "original_events_exact": True,
                   "integer_metadata_exact": True, "result_payloads_exact": True,
                   "stale_session_ignored": True, "worker_error_paused": True, "summary": summary}), flush=True)
+
+            # Hold connection establishment so the actual C++ unsent FIFO fills.
+            # Tiny complete batches exercise the 32-batch guard without large allocations.
+            connection.close()
+            connection = None
+            server.close()
+            server = socket.socket()
+            server.bind(('127.0.0.1', 0))
+            server.settimeout(10)
+            wait_for(lambda: publisher.get_num_connections() == 0, 'old bridge shutdown')
+            process = subprocess.Popen([
+                'rosrun', 'nrv_demo', 'e2fai_bridge', '_session_id:=overflow-session',
+                '_host:=127.0.0.1', '_port:=' + str(server.getsockname()[1]),
+                '_output_dir:=' + directory, '_perf_enabled:=false'
+            ], stdout=log, stderr=subprocess.STDOUT)
+            wait_for(lambda: publisher.get_num_connections() > 0, 'new event subscriber')
+            for _ in range(34):
+                publisher.publish(message)
+                time.sleep(.02)
+            wait_for(lambda: any(s['session_id'] == 'overflow-session' and s['batches'] == 34
+                                 for s in statuses), 'sender FIFO overflow')
+            overflow_status = next(s for s in reversed(statuses) if s['session_id'] == 'overflow-session')
+            assert overflow_status['state'] == 'catching_up', overflow_status
+            assert overflow_status['catchup_discarded_batches'] == 17, overflow_status
+            server.listen(1)
+            connection, _ = server.accept()
+            retained = [recv_packet(connection) for _ in range(17)]
+            assert [p[1]['batch_seq'] for p in retained] == list(range(17, 34)), retained
+            assert all(p[1]['bridge_generation'] == 1 and bytes(p[2]) == original.tobytes()
+                       for p in retained), 'Retained events changed or lost the recovery marker'
+            send_packet(connection, 'result', dict(output_meta, session_id='overflow-session',
+                        bridge_generation=0), gray + color + flow)
+            send_packet(connection, 'result', dict(output_meta, session_id='overflow-session',
+                        window_id=9, bridge_generation=1, processing_generation=1), gray + color + flow)
+            wait_for(lambda: len(results) >= 3, 'result after upstream recovery')
+            assert [r.window_id for r in results] == [7, 8, 9], results
+            process.send_signal(signal.SIGINT)
+            process.wait(timeout=10)
+            recovered = json.loads((output / 'bridge_summary.json').read_text())
+            assert recovered['local_errors'] == recovered['worker_errors'] == 0, recovered
+            assert recovered['catchup_discarded_batches'] == 17 and recovered['results'] == 1, recovered
+            print('CPP_BRIDGE_CATCHUP ' + json.dumps(recovered), flush=True)
             result_sub.unregister()
             status_sub.unregister()
         finally:
@@ -164,6 +215,7 @@ class CppBridgeInteropTests(unittest.TestCase):
         evidence = next(line for line in result.stdout.splitlines() if line.startswith("CPP_BRIDGE_INTEROP "))
         self.assertEqual(json.loads(evidence.split(" ", 1)[1])["status"], "PASS")
         print(evidence, flush=True)
+        print(next(line for line in result.stdout.splitlines() if line.startswith('CPP_BRIDGE_CATCHUP ')), flush=True)
 
 
 if __name__ == "__main__":

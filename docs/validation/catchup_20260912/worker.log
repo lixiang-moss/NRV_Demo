@@ -1,0 +1,27 @@
+test_batch_guard_and_disabled_freshness (test_e2fai_worker.QueueTests) ... ok
+test_byte_limit_is_independent_of_batch_limit (test_e2fai_worker.QueueTests) ... ok
+test_capacity_catchup_trims_whole_prefix_before_insertion (test_e2fai_worker.QueueTests) ... ok
+test_capacity_failure_does_not_replace_older_item (test_e2fai_worker.QueueTests) ... ok
+test_default_byte_capacity_accepts_one_gib_and_rejects_next_byte (test_e2fai_worker.QueueTests) ... ok
+test_default_queue_accepts_256_in_order_and_reports_actual_limit (test_e2fai_worker.QueueTests) ... ok
+test_freshness_uses_callback_age_and_retains_recent_suffix (test_e2fai_worker.QueueTests) ... ok
+test_invalid_event_size_and_polarity_are_explicit (test_e2fai_worker.QueueTests) ... ok
+test_window_and_preview_scale_defaults_and_override (test_e2fai_worker.QueueTests) ... ok
+test_catchup_invalidates_active_render_and_pending_result_without_stopping (test_e2fai_worker.ResultProcessorTests) ... ok
+test_disconnect_releases_blocked_socket_send_and_cleans_result_thread (test_e2fai_worker.ResultProcessorTests) ... ok
+test_full_result_queue_wait_is_released_by_stop (test_e2fai_worker.ResultProcessorTests) ... ok
+test_inline_and_thread_keep_bytes_order_and_reset_display_range (test_e2fai_worker.ResultProcessorTests) ... ok
+test_complete_window_wait_and_buffer_overflow_both_resume (test_e2fai_worker.SessionTests) ... ok
+test_disabled_measurement_adds_no_cuda_sync_or_events (test_e2fai_worker.SessionTests) ... ok
+test_normal_window_collection_is_not_counted_as_backlog (test_e2fai_worker.SessionTests) ... ok
+test_overload_during_forward_discards_old_output_and_resets_gru (test_e2fai_worker.SessionTests) ... ok
+test_receiver_overflow_keeps_latest_and_connection_alive (test_e2fai_worker.SessionTests) ... ok
+test_reconnect_never_reuses_recurrent_state_or_session_id (test_e2fai_worker.SessionTests) ... ok
+test_ros_gap_resets_gru_without_bridge_packet_gap (test_e2fai_worker.SessionTests) ... ok
+test_session_id_change_is_rejected (test_e2fai_worker.SessionTests) ... ok
+test_time_discontinuity_resets_gru_before_next_segment (test_e2fai_worker.SessionTests) ... ok
+
+----------------------------------------------------------------------
+Ran 22 tests in 1.441s
+
+OK

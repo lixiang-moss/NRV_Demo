@@ -1,0 +1,8 @@
+test_nef1_event_and_result_interoperability_without_gpu_or_camera (test_e2fai_cpp_bridge.CppBridgeInteropTests) ... CPP_BRIDGE_INTEROP {"status": "PASS", "original_events_exact": true, "integer_metadata_exact": true, "result_payloads_exact": true, "stale_session_ignored": true, "worker_error_paused": true, "summary": {"batches": 1, "bridge_implementation": "roscpp", "catchup_count": 0, "catchup_discarded_batches": 0, "catchup_discarded_bytes": 0, "catchup_discarded_events": 0, "detail": "test pause", "discarded_batches": 0, "discarded_bytes": 0, "discarded_events": 0, "error_code": "probe_stop", "local_errors": 0, "queue_peak_batches": 1, "queue_peak_bytes": 39, "results": 2, "session_id": "interop-session", "state": "paused", "state_before_stop": "paused", "stop_reason": "failure", "worker_errors": 1}}
+CPP_BRIDGE_CATCHUP {"batches": 34, "bridge_implementation": "roscpp", "catchup_count": 1, "catchup_discarded_batches": 17, "catchup_discarded_bytes": 663, "catchup_discarded_events": 51, "detail": "", "discarded_batches": 0, "discarded_bytes": 0, "discarded_events": 0, "error_code": "", "local_errors": 0, "queue_peak_batches": 32, "queue_peak_bytes": 1248, "results": 1, "session_id": "overflow-session", "state": "stopped", "state_before_stop": "connected", "stop_reason": "acquisition_stopped", "worker_errors": 0}
+ok
+
+----------------------------------------------------------------------
+Ran 1 test in 5.142s
+
+OK

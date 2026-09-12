@@ -241,6 +241,7 @@ class NoiseWindow(Q.QMainWindow):
             self.latest_status = None
             self.latest_model_status = None
             self.last_frame = 0
+            self.model_generation = 0
         for view in self.views.values():
             view.clear()
             view.setText('Waiting for camera data')
@@ -328,10 +329,15 @@ class NoiseWindow(Q.QMainWindow):
             if self.session_id is None or message.session_id != self.session_id:
                 self.perf.increment('stale_session_results')
                 return
+            generation = getattr(message, 'processing_generation', 0)
+            if generation < getattr(self, 'model_generation', 0):
+                self.perf.increment('catchup_stale_results')
+                return
+            self.model_generation = generation
             if 'e2fai_gray' in self.frames or 'e2fai_flow' in self.frames:
                 self.perf.increment('latest_result_overwrites')
             metadata = dict(window_id=message.window_id, source_callback_ns=message.source_callback_ns,
-                            window_end_ns=message.window_end_ns)
+                            window_end_ns=message.window_end_ns, processing_generation=generation)
             self.frames['e2fai_gray'] = (message.gray, received, metadata)
             self.frames['e2fai_flow'] = (message.flow_preview, received, metadata)
 
@@ -342,6 +348,13 @@ class NoiseWindow(Q.QMainWindow):
             return
         with self.lock:
             if self.session_id is not None and status.get('session_id') == self.session_id:
+                generation = status.get('processing_generation', 0)
+                if generation < getattr(self, 'model_generation', 0):
+                    return
+                if generation > getattr(self, 'model_generation', 0):
+                    for key in ('e2fai_gray', 'e2fai_flow'):
+                        self.frames.pop(key, None)
+                self.model_generation = generation
                 self.latest_model_status = status
 
     def refresh(self):
@@ -362,6 +375,8 @@ class NoiseWindow(Q.QMainWindow):
             model_status = self.latest_model_status
             last = self.last_frame
         for key, (message, received, metadata) in frames.items():
+            if metadata.get('processing_generation', getattr(self, 'model_generation', 0)) < getattr(self, 'model_generation', 0):
+                continue
             if not self.view_actions[key].isChecked():
                 continue
             self.perf.elapsed('receive_to_refresh', received, source=key, **metadata)
@@ -376,8 +391,14 @@ class NoiseWindow(Q.QMainWindow):
             if message.encoding == 'bgr8':
                 image = image.rgbSwapped()
             view = self.views[key]
-            view.setPixmap(QtGui.QPixmap.fromImage(image).scaled(view.contentsRect().size(), QtCore.Qt.KeepAspectRatio,
-                                                                QtCore.Qt.SmoothTransformation))
+            pixmap = QtGui.QPixmap.fromImage(image).scaled(view.contentsRect().size(), QtCore.Qt.KeepAspectRatio,
+                                                         QtCore.Qt.SmoothTransformation)
+            # Status can arrive on a ROS thread while image conversion runs.
+            # Recheck atomically with presentation; keep scaling outside the lock.
+            with self.lock:
+                if metadata.get('processing_generation', getattr(self, 'model_generation', 0)) < getattr(self, 'model_generation', 0):
+                    continue
+                view.setPixmap(pixmap)
             self.perf.elapsed('image_convert_scale_setpixmap', tick, source=key, **metadata)
             self.perf.increment('presentations_' + key)
             if self.perf.enabled and metadata.get('source_callback_ns'):
@@ -391,7 +412,8 @@ class NoiseWindow(Q.QMainWindow):
                                   source=key, window_id=metadata['window_id'])
         if model_status:
             text = 'E2FAI: {}   Results: {}   Queue: {}'.format(
-                model_status['state'], model_status['results'], model_status['queue_batches'])
+                '正在追赶' if model_status['state'] == 'catching_up' else model_status['state'],
+                model_status['results'], model_status['queue_batches'])
             if model_status.get('detail'):
                 text += '   ' + model_status['detail']
             self.model_status.setText(text)

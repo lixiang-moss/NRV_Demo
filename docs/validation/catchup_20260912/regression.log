@@ -1,0 +1,27 @@
+test_native_full_event_algorithm_matches_source (test_e2fai_preprocessing.VoxelTests) ... ok
+test_reversed_timestamps_are_rejected_instead_of_sorted (test_e2fai_preprocessing.VoxelTests) ... ok
+test_constant_zero_or_unconfirmed_ros_sequences_are_not_false_gaps (test_e2fai_preprocessing.WindowTests) ... ok
+test_cross_batch_gap_sequence_gap_and_empty_batch (test_e2fai_preprocessing.WindowTests) ... ok
+test_defaults_use_250ms_windows_but_300ms_gap (test_e2fai_preprocessing.WindowTests) ... ok
+test_duplicate_and_backward_ros_sequences_reset_without_huge_missing_count (test_e2fai_preprocessing.WindowTests) ... ok
+test_equal_timestamp_order_is_unchanged (test_e2fai_preprocessing.WindowTests) ... ok
+test_fragmented_input_preserves_every_event (test_e2fai_preprocessing.WindowTests) ... ok
+test_half_open_boundaries_and_source_batch_provenance (test_e2fai_preprocessing.WindowTests) ... ok
+test_intra_batch_large_forward_jump_has_no_empty_window_loop (test_e2fai_preprocessing.WindowTests) ... ok
+test_intra_batch_reversal_preserves_order_and_resets (test_e2fai_preprocessing.WindowTests) ... ok
+test_ros_gap_resets_even_when_bridge_sequence_is_contiguous (test_e2fai_preprocessing.WindowTests) ... ok
+test_ros_uint32_wrap_is_contiguous (test_e2fai_preprocessing.WindowTests) ... ok
+test_stalled_timestamp_buffer_fails_at_capacity_without_sampling (test_e2fai_preprocessing.WindowTests) ... ok
+test_clean_eof_and_partial_eof_are_distinct (test_e2fai_protocol.ProtocolTests) ... ok
+test_fragmented_frame_keeps_partial_bytes (test_e2fai_protocol.ProtocolTests) ... ok
+test_original_nanoseconds_survive_lossless_round_trip (test_e2fai_protocol.ProtocolTests) ... ok
+test_oversized_or_unknown_header_is_rejected_before_payload (test_e2fai_protocol.ProtocolTests) ... ok
+test_roscpp_overwrites_zero_header_sequence_on_serialized_delivery (test_e2fai_ros_sequence.RealRosSequenceTests) ... skipped 'Set NRV_TEST_ROS_SEQUENCE=1 for isolated real roscpp-to-rospy serialization'
+test_capture_pass_does_not_hide_model_failure (test_integration_summary.IntegrationSummaryTests) ... ok
+test_catchup_is_reported_as_data_loss_not_a_session_error (test_integration_summary.IntegrationSummaryTests) ... ok
+test_stream_resets_and_disabled_model (test_integration_summary.IntegrationSummaryTests) ... ok
+
+----------------------------------------------------------------------
+Ran 22 tests in 0.065s
+
+OK (skipped=1)

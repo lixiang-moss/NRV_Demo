@@ -10,6 +10,20 @@ spec.loader.exec_module(module)
 
 
 class IntegrationSummaryTests(unittest.TestCase):
+    def test_catchup_is_reported_as_data_loss_not_a_session_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder/'summary.json').write_text('{"status":"PASS","raw_sequence_gaps":0}')
+            (folder/'sessions/test').mkdir(parents=True)
+            (folder/'sessions/test/bridge_summary.json').write_text('{"state":"stopped"}')
+            (folder/'e2fai_session_001.json').write_text(
+                '{"results":4,"error":null,"catchup_count":1,"catchup_discarded_batches":3}')
+            result = module.inspect_run(folder)
+            self.assertEqual(result['status'], 'DEGRADED')
+            self.assertEqual(result['errors'], [])
+            self.assertEqual(result['catchup_discarded_batches'], 3)
+            self.assertEqual(result['ros_sequence_gap_incidents'], 0)
+
     def test_capture_pass_does_not_hide_model_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder=Path(tmp)

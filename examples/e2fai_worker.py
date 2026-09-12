@@ -29,12 +29,16 @@ from nrv_e2fai.preprocessing import EventWindowBuffer, NUM_BINS, RunningRange, v
 from nrv_e2fai.visualization import flow_hsv_rgb
 from performance import PerfRecorder
 
-DEFAULT_QUEUE_BATCHES = 64
+DEFAULT_QUEUE_BATCHES = 256
 DEFAULT_QUEUE_BYTES = 1024 * 1024 * 1024
+QUEUE_TRIGGER_BYTES = 512 * 1024 * 1024
+QUEUE_TARGET_BYTES = 256 * 1024 * 1024
+WAIT_LIMIT_NS = 250_000_000
+WAIT_TARGET_NS = 125_000_000
 
 
 class BoundedEventQueue:
-    """FIFO with explicit overload failure; no drop-oldest or catch-up policy."""
+    """Hard-bounded FIFO; its session owner applies whole-batch catch-up."""
     def __init__(self, max_batches=DEFAULT_QUEUE_BATCHES, max_bytes=DEFAULT_QUEUE_BYTES):
         self.max_batches, self.max_bytes = max_batches, max_bytes
         self.items = deque()
@@ -46,7 +50,7 @@ class BoundedEventQueue:
         with self.lock:
             if len(self.items) >= self.max_batches or self.bytes + size > self.max_bytes:
                 raise OverflowError(
-                    "Host event FIFO exceeded {} batches / {:g} MiB; session paused".format(
+                    "Host event FIFO exceeded {} batches / {:g} MiB".format(
                         self.max_batches, self.max_bytes / (1024 * 1024)))
             self.items.append((item, size))
             self.bytes += size
@@ -78,6 +82,39 @@ class BoundedEventQueue:
                         oldest_callback_ns=items[0][1]["callback_ns"] if items else None,
                         source_span_ns=(int(event_parts[-1]["timestamp_ns"][-1])
                                         - int(event_parts[0]["timestamp_ns"][0])) if event_parts else 0)
+
+    def trim(self, now, incoming=None, freshness=True, catching_up=False):
+        """Trim BEFORE insertion. Return reason and discarded batch/event/byte counts.
+
+        Retain a contiguous suffix, including the incoming batch if it fits.
+        An individually oversized or stale incoming batch is discarded whole.
+        Called under the session lock, together with generation tagging/get().
+        """
+        with self.lock:
+            candidates = deque(self.items)
+            total = self.bytes
+            if incoming is not None:
+                candidates.append(incoming)
+                total += incoming[1]
+            oldest_age = now - candidates[0][0][1]["callback_ns"] if candidates else 0
+            reason = ("queue_capacity" if total >= min(QUEUE_TRIGGER_BYTES, self.max_bytes)
+                      or len(candidates) >= self.max_batches else
+                      "queue_freshness" if freshness and oldest_age > WAIT_LIMIT_NS else None)
+            discarded = [0, 0, 0]
+            if reason or catching_up:
+                target_bytes = min(QUEUE_TARGET_BYTES, self.max_bytes)
+                target_batches = max(1, self.max_batches // 2)
+                while candidates and (total > target_bytes or len(candidates) > target_batches
+                        or (freshness and now - candidates[0][0][1]["callback_ns"] > WAIT_TARGET_NS)):
+                    item, size = candidates.popleft()
+                    discarded[0] += 1
+                    discarded[1] += len(item[0])
+                    discarded[2] += size
+                    total -= size
+            self.items, self.bytes = candidates, total
+            self.peak_batches = max(self.peak_batches, len(candidates))
+            self.peak_bytes = max(self.peak_bytes, total)
+            return reason or ("queue_freshness" if discarded[0] else None), discarded
 
 
 def observe_queue(perf, fifo):
@@ -116,7 +153,8 @@ def validate_events(metadata, payload):
 
 
 class SessionReceiver:
-    def __init__(self, connection, perf, max_batches=DEFAULT_QUEUE_BATCHES, max_bytes=DEFAULT_QUEUE_BYTES):
+    def __init__(self, connection, perf, max_batches=DEFAULT_QUEUE_BATCHES,
+                 max_bytes=DEFAULT_QUEUE_BYTES, freshness=True):
         self.connection, self.perf = connection, perf
         self.queue = BoundedEventQueue(max_batches, max_bytes)
         self.send_lock = threading.Lock()
@@ -126,6 +164,16 @@ class SessionReceiver:
         self.session_id = None
         self.received_batches = self.received_events = 0
         self.rejected_batches = self.rejected_events = 0
+        self.rejected_bytes = 0
+        self.freshness = freshness
+        self.recovery_lock = threading.RLock()
+        self.processing_generation = 0
+        self.generation_claimed = False
+        self.catching_up = False
+        self.recovery_reason = "session_start"
+        self.recovery_count = 0
+        self.bridge_generation = 0
+        self.status_pending = None
         self.thread = threading.Thread(target=self._run, name="e2fai-event-reader", daemon=True)
         self.thread.start()
 
@@ -133,8 +181,64 @@ class SessionReceiver:
         with self.send_lock:
             if kind == "result" and (self.failed.is_set() or self.done.is_set()):
                 return False
+            if kind == "result" and self.stale(metadata):
+                return False
             send_packet(self.connection, kind, metadata, payload)
             return True
+
+    def stale(self, metadata):
+        return metadata.get("processing_generation", 0) != self.processing_generation
+
+    def _recover(self, reason):
+        # Merge repeated drops until inference has claimed data in this generation.
+        if not self.catching_up or self.generation_claimed:
+            self.processing_generation += 1
+            self.recovery_count += 1
+            self.generation_claimed = False
+            self.perf.observe("catchup", 1, unit="recovery",
+                              processing_generation=self.processing_generation, reason=reason)
+        self.catching_up, self.recovery_reason = True, reason
+        self.status_pending = dict(session_id=self.session_id, state="catching_up",
+                                   processing_generation=self.processing_generation, reason=reason)
+        for item, _ in self.queue.items:
+            item[1]["processing_generation"] = self.processing_generation
+
+    def recover(self, reason):
+        with self.recovery_lock:
+            self._recover(reason)
+            self._trim()
+
+    def _trim(self, incoming=None):
+        reason, discarded = self.queue.trim(time.monotonic_ns(), incoming,
+                                             self.freshness, self.catching_up)
+        if discarded[0]:
+            self.rejected_batches += discarded[0]
+            self.rejected_events += discarded[1]
+            self.rejected_bytes += discarded[2]
+            self._recover(reason)
+            self.perf.increment("catchup_discarded_batches", discarded[0])
+            self.perf.increment("catchup_discarded_events", discarded[1])
+
+    def take(self):
+        with self.recovery_lock:
+            self._trim()
+            item = self.queue.get()
+            if item is not None:
+                self.generation_claimed = True
+            return item
+
+    def send_status(self):
+        with self.recovery_lock:
+            status, self.status_pending = self.status_pending, None
+        if status is not None and not self.done.is_set():
+            self.send("status", status)
+
+    def result_sent(self, metadata):
+        with self.recovery_lock:
+            if not self.stale(metadata) and self.catching_up:
+                self.catching_up = False
+                self.status_pending = dict(session_id=self.session_id, state="connected",
+                    processing_generation=self.processing_generation, reason="fresh_result")
 
     def fail(self, code, message):
         if self.failed.is_set():
@@ -168,18 +272,32 @@ class SessionReceiver:
                     raise ProtocolError("A TCP connection cannot mix acquisition sessions")
                 self.perf.elapsed("bridge_unpack", tick, events=len(events),
                                   batch_seq=metadata["batch_seq"])
-                received_ns = time.monotonic_ns() if self.perf.enabled else 0
+                received_ns = time.monotonic_ns()
                 self.received_batches += 1
                 self.received_events += len(events)
                 if self.perf.enabled:
                     self.perf.observe("callback_to_host_receive", (received_ns - metadata["callback_ns"]) / 1e6,
                                       events=len(events), batch_seq=metadata["batch_seq"])
-                self.queue.put((events, metadata, received_ns), len(payload))
+                with self.recovery_lock:
+                    bridge_generation = metadata.get("bridge_generation", 0)
+                    if type(bridge_generation) is not int or bridge_generation < self.bridge_generation:
+                        raise ProtocolError("Invalid bridge recovery generation")
+                    if bridge_generation != self.bridge_generation:
+                        self.bridge_generation = bridge_generation
+                        # An upstream drop separates the old prefix from this batch.
+                        discarded_bytes = self.queue.bytes
+                        batches, count = self.queue.clear()
+                        self.rejected_batches += batches
+                        self.rejected_events += count
+                        self.rejected_bytes += discarded_bytes
+                        self._recover("bridge_queue_overflow")
+                    metadata["processing_generation"] = self.processing_generation
+                    self._trim(((events, metadata, received_ns), len(payload)))
                 observe_queue(self.perf, self.queue)
-        except OverflowError as error:
-            self.rejected_batches += 1
-            self.rejected_events += len(events)
-            self.fail("queue_overflow", error)
+        except ConnectionResetError:
+            # Stop may close the peer with unread status/result bytes, yielding
+            # TCP RST instead of EOF. Both end this acquisition session.
+            self.done.set()
         except (OSError, EOFError, ValueError) as error:
             if not self.done.is_set():
                 self.fail("protocol_or_connection_error", error)
@@ -223,6 +341,7 @@ class ResultProcessor:
         self.generation = None
         self.result_count = self.queue_peak = 0
         self.cancelled_results = self.cancelled_events = 0
+        self.stale_results = self.stale_events = 0
         self.thread = None
         if mode == "thread":
             self.thread = threading.Thread(target=self._run, name="e2fai-results", daemon=True)
@@ -234,6 +353,14 @@ class ResultProcessor:
         return (self.stopping.is_set() or self.receiver.done.is_set()
                 or self.receiver.failed.is_set() or self.should_stop())
 
+    def _stale(self, metadata):
+        return metadata.get("processing_generation", 0) != getattr(self.receiver, "processing_generation", 0)
+
+    def _discard_stale(self, job):
+        self.stale_results += 1
+        self.stale_events += job["events"]
+        return True  # Keep the consumer alive for fresh jobs.
+
     def submit(self, snapshot, metadata, events, copy_ms=0):
         job = dict(snapshot=snapshot, metadata=dict(metadata), events=events,
                    copy_ms=copy_ms, enqueued_ns=0)
@@ -241,6 +368,8 @@ class ResultProcessor:
         if self.mode == "inline":
             return self._process(job)
         while not self._cancelled():
+            if self._stale(metadata):
+                return self._discard_stale(job)
             try:
                 # Only the successful nonblocking put supplies the timestamp;
                 # earlier full-queue waits are measured separately.
@@ -260,6 +389,10 @@ class ResultProcessor:
             self.cancelled_events += job["events"]
             return False
         metadata, events = job["metadata"], job["events"]
+        if self._stale(metadata):
+            return self._discard_stale(job)
+        if hasattr(self.receiver, "send_status"):
+            self.receiver.send_status()
         window_id = metadata["window_id"]
         if job["enqueued_ns"]:
             self.perf.elapsed("result_queue_residence", job["enqueued_ns"],
@@ -281,6 +414,8 @@ class ResultProcessor:
             self.cancelled_results += 1
             self.cancelled_events += events
             return False
+        if self._stale(metadata):
+            return self._discard_stale(job)
         metadata.update(completed_ns=time.monotonic_ns(),
                         flow_units="model_input_pixels_per_window",
                         timestamp_source="group_aer_corrected_sensor_clock_ros_anchor")
@@ -292,6 +427,8 @@ class ResultProcessor:
             self.cancelled_events += events
             raise
         if not sent:
+            if self._stale(metadata):
+                return self._discard_stale(job)
             self.cancelled_results += 1
             self.cancelled_events += events
             return False
@@ -307,17 +444,23 @@ class ResultProcessor:
                                   "width", "height", "reset_count", "reset_reason", "source_callback_ns",
                                   "completed_ns")})
         self.result_count += 1
+        if hasattr(self.receiver, "result_sent"):
+            self.receiver.result_sent(metadata)
         return True
 
     def _run(self):
         try:
             while not self._cancelled():
+                if hasattr(self.receiver, "send_status"):
+                    self.receiver.send_status()
                 try:
                     job = self.queue.get(timeout=0.05)
                 except queue.Empty:
                     continue
                 if not self._process(job):
                     break
+        except (BrokenPipeError, ConnectionResetError):
+            self.receiver.done.set()
         except (OSError, ValueError, RuntimeError) as error:
             if not self._cancelled():
                 self.receiver.fail("inference_or_send_error", error)
@@ -341,11 +484,14 @@ class ResultProcessor:
         self.image_range = RunningRange()
         return dict(pending_results_cleared_on_disconnect=self.cancelled_results,
                     pending_result_events_cleared_on_disconnect=self.cancelled_events,
+                    catchup_stale_results=self.stale_results,
+                    catchup_stale_result_events=self.stale_events,
                     result_queue_peak=self.queue_peak)
 
 
 def run_session(connection, model, device, args, perf, should_stop):
-    receiver = SessionReceiver(connection, perf, max_batches=args.queue_batches)
+    receiver = SessionReceiver(connection, perf, max_batches=args.queue_batches,
+                               freshness=getattr(args, "freshness", True))
     windows = EventWindowBuffer(round(args.window_ms * 1e6))
     state = None
     state_generation = None
@@ -353,14 +499,35 @@ def run_session(connection, model, device, args, perf, should_stop):
                               getattr(args, "result_mode", "thread"), should_stop)
     inference_count = input_events = small_windows = small_window_events = 0
     pending_window_events = 0
+    active_generation = 0
+    skipped_window_events = skipped_partial_events = skipped_inferences = 0
     summary = {}
+
+    def reset_catchup_state(generation):
+        nonlocal skipped_partial_events, state, state_generation, active_generation
+        skipped_partial_events += windows.buffered_events
+        previous_discarded = windows.discarded_partial_events
+        windows.reset(receiver.recovery_reason)
+        windows.discarded_partial_events = previous_discarded
+        windows.previous_batch = windows.previous_ros_sequence = None
+        state = state_generation = None
+        active_generation = generation
+
     try:
         while not should_stop() and not receiver.done.is_set():
-            item = receiver.queue.get()
+            if results.mode == "inline":
+                receiver.send_status()
+            item = receiver.take()
             if item is None:
+                if active_generation != receiver.processing_generation:
+                    reset_catchup_state(receiver.processing_generation)
                 receiver.done.wait(0.01)
                 continue
             events, metadata, received_ns = item
+            batch_generation = metadata["processing_generation"]
+            if batch_generation != active_generation:
+                # Track intentional drops separately from source publication gaps.
+                reset_catchup_state(batch_generation)
             observe_queue(perf, receiver.queue)
             if (metadata["width"], metadata["height"]) != (args.sensor_width, args.sensor_height):
                 receiver.fail("resolution_mismatch", "Event resolution does not match model configuration")
@@ -370,7 +537,17 @@ def run_session(connection, model, device, args, perf, should_stop):
                              events=len(events), batch_seq=metadata["batch_seq"])
             tick = perf.tick()
             previous_ros_gaps = windows.ros_sequence_gap_incidents
-            assembled = windows.push(events, metadata)
+            buffered_before = windows.buffered_events
+            time_discarded_before = windows.discarded_partial_events
+            try:
+                assembled = windows.push(events, metadata)
+            except OverflowError:
+                skipped_window_events += len(events)
+                skipped_partial_events += buffered_before
+                windows.parts.clear()
+                windows.discarded_partial_events = time_discarded_before
+                receiver.recover("window_buffer_overflow")
+                continue
             perf.increment("ros_sequence_gap_incidents",
                            windows.ros_sequence_gap_incidents - previous_ros_gaps)
             pending_window_events = sum(len(window.events) for window in assembled)
@@ -378,6 +555,18 @@ def run_session(connection, model, device, args, perf, should_stop):
             for window in assembled:
                 if receiver.done.is_set() or should_stop():
                     break
+                if (receiver.freshness and time.monotonic_ns() - received_ns > WAIT_LIMIT_NS
+                        and active_generation == receiver.processing_generation):
+                    receiver.recover("window_freshness")
+                if active_generation != receiver.processing_generation:
+                    skipped_window_events += pending_window_events
+                    pending_window_events = 0
+                    break
+                window.metadata.update(processing_generation=active_generation,
+                                       bridge_generation=metadata.get("bridge_generation", 0),
+                                       input_complete_ns=received_ns)
+                perf.observe("complete_window_wait", (time.monotonic_ns() - received_ns) / 1e6,
+                             events=len(window.events), window_id=window.metadata["window_id"])
                 if len(window.events) < 2:
                     small_windows += 1
                     small_window_events += len(window.events)
@@ -424,6 +613,12 @@ def run_session(connection, model, device, args, perf, should_stop):
                 inference_count += 1
                 input_events += len(window.events)
                 pending_window_events -= len(window.events)
+                if active_generation != receiver.processing_generation:
+                    skipped_inferences += 1
+                    skipped_window_events += len(window.events) + pending_window_events
+                    pending_window_events = 0
+                    state = None
+                    break
                 tick = perf.tick()
                 snapshot = snapshot_output(output)
                 copy_ms = (time.perf_counter_ns() - tick) / 1e6 if perf.enabled else 0
@@ -433,8 +628,11 @@ def run_session(connection, model, device, args, perf, should_stop):
                              window_id=window.metadata["window_id"])
                 if not results.submit(snapshot, window.metadata, len(window.events), copy_ms):
                     break
-    except OverflowError as error:
-        receiver.fail("window_buffer_overflow", error)
+            # Release skipped complete windows even if no more input arrives.
+            assembled.clear()
+            events = window = None
+    except (BrokenPipeError, ConnectionResetError):
+        receiver.done.set()
     except (OSError, ValueError, RuntimeError) as error:
         receiver.fail("inference_or_send_error", error)
     finally:
@@ -447,6 +645,16 @@ def run_session(connection, model, device, args, perf, should_stop):
                        received_events=receiver.received_events,
                        overload_rejected_batches=receiver.rejected_batches,
                        overload_rejected_events=receiver.rejected_events,
+                       catchup_count=receiver.recovery_count,
+                       catchup_discarded_batches=receiver.rejected_batches,
+                       catchup_discarded_events=receiver.rejected_events,
+                       catchup_discarded_bytes=receiver.rejected_bytes,
+                       catchup_complete_window_events=skipped_window_events,
+                       catchup_partial_window_events=skipped_partial_events,
+                       catchup_stale_inferences=skipped_inferences,
+                       freshness_enabled=receiver.freshness,
+                       queue_trigger_bytes=QUEUE_TRIGGER_BYTES, queue_target_bytes=QUEUE_TARGET_BYTES,
+                       wait_limit_ms=WAIT_LIMIT_NS / 1e6, wait_target_ms=WAIT_TARGET_NS / 1e6,
                        pending_batches_cleared_on_disconnect=discarded_batches,
                        pending_events_cleared_on_disconnect=discarded_events,
                        partial_window_events_at_disconnect=windows.buffered_events,
@@ -477,6 +685,8 @@ def parse_args(argv=None):
                         help="CPU rendering/packing and TCP sending mode (default: thread)")
     parser.add_argument("--queue-batches", type=int, default=DEFAULT_QUEUE_BATCHES,
                         help="Host FIFO batch limit; byte limit is 1 GiB (1024 MiB)")
+    parser.add_argument("--no-freshness", dest="freshness", action="store_false",
+                        help="Disable waiting-time catch-up only; capacity catch-up remains enabled")
     parser.add_argument("--sensor-width", type=int, default=960)
     parser.add_argument("--sensor-height", type=int, default=720)
     parser.add_argument("--backbone", type=Path, required=True)

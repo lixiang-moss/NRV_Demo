@@ -116,7 +116,7 @@ class EventWindowBuffer:
 
     def _append_segment(self, events, metadata):
         if (self.buffered_events + len(events)) * events.dtype.itemsize > self.max_buffer_bytes:
-            raise OverflowError("Incomplete event window exceeded 256 MiB; session paused")
+            raise OverflowError("Event window buffer exceeded its byte limit")
         if self.start_ns is None:
             self.start_ns = int(events["timestamp_ns"][0])
         self.parts.append((events, metadata))

@@ -1,0 +1,47 @@
+test_arriving_images_do_not_resize_panels_but_window_can_resize (test_gui_views.GuiTests) ... This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+ok
+test_catchup_clears_old_cache_and_rejects_old_generation (test_gui_views.GuiTests) ... This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+ok
+test_natural_finish_clears_pending_old_results_and_model_status (test_gui_views.GuiTests) ... This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+ok
+test_no_events_and_missing_worker_do_not_block_qt (test_gui_views.GuiTests) ... This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+ok
+test_nonobject_json_profile_uses_existing_load_error_dialog (test_gui_views.GuiTests) ... This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+ok
+test_old_profile_restores_three_views_and_keeps_apply_semantics (test_gui_views.GuiTests) ... This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+ok
+test_one_to_three_views_and_immediate_persistence (test_gui_views.GuiTests) ... This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+ok
+test_only_current_session_result_enters_latest_cache (test_gui_views.GuiTests) ... This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+ok
+test_raw_latest_overwrites_are_counted (test_gui_views.GuiTests) ... This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+ok
+test_start_generates_new_session_and_async_stop (test_gui_views.GuiTests) ... This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+This plugin does not support propagateSizeHints()
+ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.240s
+
+OK

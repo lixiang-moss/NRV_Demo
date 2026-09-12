@@ -20,6 +20,8 @@ def inspect_run(folder, model_enabled=True):
                       model_no_session_errors=not errors,
                       bridge_session_recorded=bool(bridges),
                       bridge_no_session_errors=not bridge_errors,
+                      model_no_catchup_drops=not any(s.get('catchup_count', 0) for s in sessions),
+                      bridge_no_catchup_drops=not any(b.get('catchup_count', 0) for b in bridges),
                       model_no_ros_sequence_gaps=not any(s.get('ros_sequence_gap_incidents', 0) for s in sessions))
     status = 'PASS' if all(checks.values()) else 'DEGRADED' if checks['raw_capture_passed'] else 'FAIL'
     result = dict(status=status, checks=checks, model_enabled=model_enabled,
@@ -27,6 +29,9 @@ def inspect_run(folder, model_enabled=True):
                   model_results=sum(s.get('results', 0) for s in sessions),
                   stream_resets=sum(s.get('reset_count', 0) for s in sessions),
                   ros_sequence_gap_incidents=sum(s.get('ros_sequence_gap_incidents', 0) for s in sessions),
+                  catchup_count=sum(s.get('catchup_count', 0) for s in sessions),
+                  catchup_discarded_batches=sum(s.get('catchup_discarded_batches', 0) for s in sessions),
+                  bridge_catchup_discarded_batches=sum(b.get('catchup_discarded_batches', 0) for b in bridges),
                   errors=errors, bridge_errors=bridge_errors,
                   note='RAW capture PASS does not establish model throughput or latency.')
     (folder / 'integration_summary.json').write_text(json.dumps(result, indent=2)+'\n')

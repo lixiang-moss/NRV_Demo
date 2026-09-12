@@ -13,6 +13,8 @@ uint32 width
 uint32 height
 string reset_reason
 uint64 reset_count
+# Catch-up generation within this acquisition session; older results are obsolete.
+uint64 processing_generation
 # Same-host monotonic times, never ROS or sensor timestamps.
 uint64 source_callback_ns
 uint64 completed_ns

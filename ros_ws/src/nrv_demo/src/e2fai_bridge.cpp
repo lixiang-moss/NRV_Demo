@@ -166,6 +166,10 @@ class E2faiBridge {
       summary.update({{"queue_peak_batches", queue_peak_batches_}, {"queue_peak_bytes", queue_peak_bytes_},
                       {"discarded_batches", discarded_batches_}, {"discarded_events", discarded_events_},
                       {"discarded_bytes", discarded_bytes_}});
+      summary.update({{"catchup_count", bridge_generation_},
+                      {"catchup_discarded_batches", catchup_batches_},
+                      {"catchup_discarded_events", catchup_events_},
+                      {"catchup_discarded_bytes", catchup_bytes_}});
     }
     std::ofstream out(output_dir_ + "/bridge_summary.json");
     if (out) out << summary.dump(2) << '\n';
@@ -189,12 +193,14 @@ class E2faiBridge {
       value = {{"session_id", session_id_}, {"state", state_}, {"detail", detail_},
                {"batches", batches_.load()}, {"results", results_.load()},
                {"local_errors", local_errors_}, {"worker_errors", worker_errors_},
-               {"error_code", error_code_}};
+               {"error_code", error_code_}, {"processing_generation", processing_generation_}};
     }
     {
       std::lock_guard<std::mutex> guard(queue_mutex_);
       value.update({{"queue_batches", queue_.size()}, {"queue_bytes", queue_bytes_},
-                    {"queue_peak_batches", queue_peak_batches_}, {"queue_peak_bytes", queue_peak_bytes_}});
+                    {"queue_peak_batches", queue_peak_batches_}, {"queue_peak_bytes", queue_peak_bytes_},
+                    {"catchup_count", bridge_generation_}, {"catchup_discarded_batches", catchup_batches_},
+                    {"catchup_discarded_events", catchup_events_}});
     }
     std_msgs::String message;
     message.data = value.dump();
@@ -243,7 +249,18 @@ class E2faiBridge {
     const Tick begin = perf_ ? Clock::now() : Tick{};
     try {
       if (message->events.size() > kMaxPayload / 13U) {
-        pause("Input event payload exceeds 256 MiB", "input_fifo_overflow");
+        {
+          std::lock_guard<std::mutex> guard(queue_mutex_);
+          ++bridge_generation_;
+          catchup_batches_ += queue_.size() + 1;
+          catchup_bytes_ += queue_bytes_ + message->events.size() * 13ULL;
+          catchup_events_ += message->events.size();
+          for (const auto &old : queue_) catchup_events_ += old.count;
+          queue_.clear();
+          queue_bytes_ = 0;
+          ++batches_;
+        }
+        markCatchingUp();
         return;
       }
       Batch batch;
@@ -269,23 +286,44 @@ class E2faiBridge {
         std::lock_guard<std::mutex> guard(queue_mutex_);
         if (stopped_) return;
         overflow = queue_.size() >= kMaxBatches || queue_bytes_ + batch.payload.size() > kMaxPayload;
-        if (!overflow) {
-          batch.queued = perf_ ? Clock::now() : Tick{};
-          queue_bytes_ += batch.payload.size();
-          queue_.push_back(std::move(batch));
-          queue_peak_batches_ = std::max(queue_peak_batches_, queue_.size());
-          queue_peak_bytes_ = std::max(queue_peak_bytes_, queue_bytes_);
+        if (overflow) {
+          ++bridge_generation_;
+          while (!queue_.empty() && (queue_.size() + 1 > kMaxBatches / 2 ||
+                 queue_bytes_ + batch.payload.size() > kMaxPayload / 2)) {
+            ++catchup_batches_;
+            catchup_events_ += queue_.front().count;
+            catchup_bytes_ += queue_.front().payload.size();
+            queue_bytes_ -= queue_.front().payload.size();
+            queue_.pop_front();
+          }
+          for (auto &retained : queue_) retained.metadata["bridge_generation"] = bridge_generation_;
         }
+        batch.metadata["bridge_generation"] = bridge_generation_;
+        batch.queued = perf_ ? Clock::now() : Tick{};
+        queue_bytes_ += batch.payload.size();
+        queue_.push_back(std::move(batch));
+        queue_peak_batches_ = std::max(queue_peak_batches_, queue_.size());
+        queue_peak_bytes_ = std::max(queue_peak_bytes_, queue_bytes_);
       }
       if (overflow) {
-        pause("Input FIFO exceeded 32 batches or 256 MiB; restart acquisition to resume", "input_fifo_overflow");
-        return;
+        markCatchingUp();
       }
       queue_ready_.notify_one();
       if (perf_) perf_->duration("object_to_wire", begin, Clock::now(), count, sequence);
     } catch (const std::exception &error) {
       pause(error.what(), "event_conversion_error");
     }
+  }
+
+  void markCatchingUp() {
+    {
+      std::lock_guard<std::mutex> guard(state_mutex_);
+      if (stopped_) return;
+      state_ = "catching_up";
+      detail_ = "Discarding old batches; inference resumes automatically";
+    }
+    ROS_WARN_THROTTLE(1.0, "E2FAI catching up: skipped unsent old batches, connection retained");
+    publishStatus();
   }
 
   int connectSocket() {
@@ -426,6 +464,8 @@ class E2faiBridge {
     result.event_count = unsignedField(metadata, "event_count");
     result.reset_reason = metadata.at("reset_reason").get<std::string>();
     result.reset_count = unsignedField(metadata, "reset_count");
+    result.processing_generation = metadata.contains("processing_generation") ?
+        unsignedField(metadata, "processing_generation") : 0;
     result.source_callback_ns = unsignedField(metadata, "source_callback_ns");
     result.completed_ns = unsignedField(metadata, "completed_ns");
     result.header.seq = static_cast<uint32_t>(result.window_id);
@@ -435,6 +475,17 @@ class E2faiBridge {
     fillImage(result.flow_preview, result, "rgb8", 3, payload, pixels, pixels * 3U);
     fillImage(result.flow, result, "32FC2", 8, payload, pixels * 4U, pixels * 8U);
     if (stopped_) return;
+    {
+      std::lock_guard<std::mutex> guard(queue_mutex_);
+      if (metadata.value("bridge_generation", uint64_t{0}) < bridge_generation_) return;
+    }
+    {
+      std::lock_guard<std::mutex> guard(state_mutex_);
+      if (result.processing_generation < processing_generation_) return;
+      processing_generation_ = result.processing_generation;
+      state_ = "connected";
+      detail_.clear();
+    }
     result_publisher_.publish(result);
     if (perf_) {
       perf_->duration("result_construct_publish", begin, Clock::now(), 0, result.window_id);
@@ -477,6 +528,18 @@ class E2faiBridge {
                 metadata.value("code", std::string("worker_error")), true);
           return;
         }
+        if (kind == "status") {
+          const uint64_t generation = unsignedField(metadata, "processing_generation");
+          {
+            std::lock_guard<std::mutex> guard(state_mutex_);
+            if (generation < processing_generation_) continue;
+            processing_generation_ = generation;
+            state_ = metadata.at("state").get<std::string>();
+            detail_ = metadata.value("reason", std::string());
+          }
+          publishStatus();
+          continue;
+        }
         if (kind != "result") throw std::runtime_error("Unexpected GPU packet: " + kind);
         publishResult(metadata, payload);
       }
@@ -497,11 +560,13 @@ class E2faiBridge {
   std::mutex state_mutex_;
   std::string state_{"connecting"}, detail_, error_code_;
   uint64_t local_errors_{0}, worker_errors_{0};
+  uint64_t processing_generation_{0};
   std::mutex queue_mutex_;
   std::condition_variable queue_ready_;
   std::deque<Batch> queue_;
   size_t queue_bytes_{0}, queue_peak_batches_{0}, queue_peak_bytes_{0};
   uint64_t discarded_batches_{0}, discarded_events_{0}, discarded_bytes_{0};
+  uint64_t bridge_generation_{0}, catchup_batches_{0}, catchup_events_{0}, catchup_bytes_{0};
   std::mutex connection_mutex_;
   int socket_{-1};
   std::thread sender_, reader_;

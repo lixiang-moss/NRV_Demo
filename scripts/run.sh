@@ -49,11 +49,12 @@ if [ "${E2FAI_ENABLED}" = true ]; then
   [ -x "${python_bin}" ] || { echo 'Model environment missing. Run scripts/setup_e2fai.sh or set E2FAI_PYTHON.' >&2; exit 1; }
   host_args=(--host 127.0.0.1 --port "${E2FAI_PORT:-8765}" --window-ms "${WINDOW_MS:-250}"
     --result-mode "${E2FAI_RESULT_MODE:-thread}"
-    --queue-batches "${E2FAI_QUEUE_BATCHES:-64}"
+    --queue-batches "${E2FAI_QUEUE_BATCHES:-256}"
     --backbone "${BACKBONE_CHECKPOINT:-${project_dir}/checkpoints/e2fai_backbone.ckpt}"
     --image-checkpoint "${IMAGE_CHECKPOINT:-${project_dir}/checkpoints/image_residual_epoch043.pt}"
     --device "${E2FAI_DEVICE:-cuda:0}" --output-dir "${run_dir}")
   [ "${PERF_ENABLED}" != true ] || host_args+=(--perf-enabled)
+  [ "${E2FAI_FRESHNESS:-true}" != false ] || host_args+=(--no-freshness)
   PYTHONNOUSERSITE=1 "${python_bin}" "${project_dir}/examples/e2fai_worker.py" "${host_args[@]}" >"${run_dir}/host.log" 2>&1 &
   host_pid=$!
   for _ in $(seq 1 480); do

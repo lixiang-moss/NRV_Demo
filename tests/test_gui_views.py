@@ -112,6 +112,26 @@ class GuiTests(unittest.TestCase):
         self.window.on_model_result(message)
         self.assertFalse(self.window.frames)
 
+    def test_catchup_clears_old_cache_and_rejects_old_generation(self):
+        self.window.session_id = 'current'
+        message = types.SimpleNamespace(session_id='current', window_id=1, source_callback_ns=0,
+                                        window_end_ns=1, gray=object(), flow_preview=object(),
+                                        processing_generation=0)
+        self.window.on_model_result(message)
+        self.assertTrue(self.window.frames)
+        status = dict(session_id='current', processing_generation=1, state='catching_up',
+                      results=0, queue_batches=0)
+        self.window.on_model_status(types.SimpleNamespace(data=json.dumps(status)))
+        self.assertFalse(self.window.frames)
+        self.window.on_model_result(message)
+        self.assertFalse(self.window.frames)
+        self.window.refresh()
+        self.assertIn('正在追赶', self.window.model_status.text())
+        message.processing_generation = 1
+        self.window.on_model_result(message)
+        self.assertTrue(self.window.frames)
+        self.window.frames.clear()
+
     def test_raw_latest_overwrites_are_counted(self):
         with patch.object(self.window.perf, 'increment') as increment:
             self.window.on_image(object(), 'raw')
