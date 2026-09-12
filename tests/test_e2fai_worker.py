@@ -61,14 +61,14 @@ class QueueTests(unittest.TestCase):
 
     def test_freshness_uses_callback_age_and_retains_recent_suffix(self):
         fifo = BoundedEventQueue()
-        for seq, callback in enumerate((0, 150_000_000, 200_000_000)):
+        for seq, callback in enumerate((0, 300_000_000, 400_000_000)):
             fifo.put(self.batch(seq, callback), 39)
-        reason, dropped = fifo.trim(300_000_000)
+        reason, dropped = fifo.trim(600_000_000)
         self.assertEqual(reason, 'queue_freshness')
         self.assertEqual(dropped, [2, 6, 78])
         self.assertEqual(fifo.get()[1]['batch_seq'], 2)
         # A just-received TCP packet can still be old at the source callback.
-        _, dropped = fifo.trim(400_000_001, (self.batch(3, 0), 39))
+        _, dropped = fifo.trim(800_000_001, (self.batch(3, 0), 39))
         self.assertEqual(dropped[0], 1)
         self.assertIsNone(fifo.get())
 
@@ -155,7 +155,7 @@ class SessionTests(unittest.TestCase):
                 meta['count'] = 2
                 send_packet(client, 'events', meta, array.tobytes())
                 if batch == 0:
-                    time.sleep(.28)
+                    time.sleep(worker.WAIT_LIMIT_NS / 1e9 + .03)
             kind, meta, _ = recv_packet(client)
             self.assertEqual(kind, 'result')
             self.assertEqual(meta['event_count'], 3)
@@ -176,7 +176,7 @@ class SessionTests(unittest.TestCase):
                 def slow_first(voxel, state):
                     output = forward(voxel, state)
                     if len(model.reset_inputs) == 1 and cause == 'window_freshness':
-                        time.sleep(.27)
+                        time.sleep(worker.WAIT_LIMIT_NS / 1e9 + .02)
                     return output
 
                 model.forward_step = slow_first
