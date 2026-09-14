@@ -28,15 +28,15 @@ def events(times):
 
 
 class WindowTests(unittest.TestCase):
-    def test_defaults_use_250ms_windows_but_300ms_gap(self):
+    def test_defaults_use_200ms_windows_but_300ms_gap(self):
         buffer = EventWindowBuffer()
-        first = events([0, 249_999_999, 250_000_000])
+        first = events([0, 199_999_999, 200_000_000])
         complete = buffer.push(first, metadata())
         self.assertEqual(complete[0].events.tobytes(), first[:2].tobytes())
-        self.assertEqual(complete[0].metadata["window_end_ns"], 250_000_000)
-        buffer.push(events([550_000_000]), metadata(1))
+        self.assertEqual(complete[0].metadata["window_end_ns"], 200_000_000)
+        buffer.push(events([500_000_000]), metadata(1))
         self.assertEqual(buffer.reset_count, 0)  # Exactly 300 ms is not a gap.
-        buffer.push(events([850_000_001]), metadata(2))
+        buffer.push(events([800_000_001]), metadata(2))
         self.assertEqual(buffer.reset_reason, "event_time_gap")
         self.assertEqual(buffer.reset_count, 1)
 

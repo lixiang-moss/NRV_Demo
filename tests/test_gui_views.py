@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 try:
-    from PyQt5 import QtCore, QtTest, QtWidgets
+    from PyQt5 import QtCore, QtGui, QtTest, QtWidgets
 except ImportError:
     QtWidgets = None
 
@@ -72,6 +72,35 @@ class GuiTests(unittest.TestCase):
         for count, key in enumerate(('e2fai_gray', 'e2fai_flow'), 2):
             self.window.view_actions[key].setChecked(True)
             self.assertEqual(self.window.view_grid.count(), count)
+
+    def test_processing_controls_have_exact_options_and_persist_when_applied(self):
+        self.assertEqual([self.window.window_ms.itemData(index)
+                          for index in range(self.window.window_ms.count())],
+                         [50, 100, 150, 200, 250])
+        self.assertEqual([self.window.resolution.itemData(index)
+                          for index in range(self.window.resolution.count())],
+                         ['960x720', '640x480', '384x288'])
+        self.assertEqual(self.window.processing_values(),
+                         {'window_ms': 200, 'width': 960, 'height': 720,
+                          'catchup_enabled': True})
+        self.window.window_ms.setCurrentIndex(self.window.window_ms.findData(50))
+        self.window.resolution.setCurrentIndex(self.window.resolution.findData('384x288'))
+        self.assertTrue(self.window.apply_button.isEnabled())
+        self.window.apply_parameters()
+        self.assertEqual(self.window.active_processing,
+                         {'window_ms': 50, 'width': 384, 'height': 288,
+                          'catchup_enabled': True})
+        saved = json.loads((self.output / 'profile.json').read_text())
+        self.assertEqual(saved['processing'], self.window.active_processing)
+        self.assertFalse(self.window.apply_button.isEnabled())
+
+    def test_legacy_profile_keeps_processing_and_invalid_processing_is_rejected(self):
+        before = self.window.processing_values()
+        self.window.set_profile(dict(bias={'0167': 12, '0168': 13}))
+        self.assertEqual(self.window.processing_values(), before)
+        with self.assertRaisesRegex(ValueError, 'unsupported'):
+            self.window.set_profile(dict(bias={'0167': 12, '0168': 13},
+                                         processing={'window_ms': 75, 'width': 960, 'height': 720}))
 
     def test_old_profile_restores_three_views_and_keeps_apply_semantics(self):
         self.window.set_profile(dict(bias={'0167': 12, '0168': 13},
@@ -140,6 +169,25 @@ class GuiTests(unittest.TestCase):
                              ['latest_frame_overwrites_raw'])
         self.window.frames.clear()
 
+    def test_original_rendering_maps_event_polarity_to_red_black_blue(self):
+        message = types.SimpleNamespace(
+            width=3, height=1, step=3, encoding='mono8', data=bytes((0, 127, 255)))
+        image = self.window._image_from_message(message, 'raw')
+        self.assertEqual(
+            [image.pixelColor(x, 0).getRgb()[:3] for x in range(3)],
+            [(255, 0, 0), (0, 0, 0), (0, 0, 255)])
+
+        reconstruction = self.window._image_from_message(message, 'e2fai_gray')
+        self.assertEqual(
+            [reconstruction.pixelColor(x, 0).getRgb()[:3] for x in range(3)],
+            [(0, 0, 0), (127, 127, 127), (255, 255, 255)])
+
+        flow = types.SimpleNamespace(
+            width=1, height=1, step=3, encoding='rgb8', data=bytes((12, 34, 56)))
+        self.assertEqual(
+            self.window._image_from_message(flow, 'e2fai_flow').pixelColor(0, 0).getRgb()[:3],
+            (12, 34, 56))
+
     def test_arriving_images_do_not_resize_panels_but_window_can_resize(self):
         from PyQt5 import QtGui
         self.window.show()
@@ -197,6 +245,11 @@ class GuiTests(unittest.TestCase):
         self.window.process = process
         self.window.start()
         first = self.window.session_id
+        first_args = process.calls[0][1]
+        self.assertIn('window_ms:=200', first_args)
+        self.assertIn('processing_width:=960', first_args)
+        self.assertIn('processing_height:=720', first_args)
+        self.assertIn('catchup_enabled:=true', first_args)
         with patch.object(self.module.os, 'kill') as kill:
             self.window.stop()
             kill.assert_called_once()
@@ -212,6 +265,44 @@ class GuiTests(unittest.TestCase):
         process.current = QtCore.QProcess.NotRunning
         self.window.finished()
         self.app.processEvents()
+
+    def test_apply_processing_while_running_restarts_with_new_values(self):
+        class Process:
+            def __init__(self):
+                self.current = QtCore.QProcess.Running
+                self.calls = []
+
+            def state(self):
+                return self.current
+
+            def start(self, command, arguments):
+                self.calls.append((command, arguments))
+                self.current = QtCore.QProcess.Running
+
+            def processId(self):
+                return 123456
+
+        process = Process()
+        self.window.process = process
+        self.window.session_id = 'old-session'
+        self.window.window_ms.setCurrentIndex(self.window.window_ms.findData(150))
+        self.window.resolution.setCurrentIndex(self.window.resolution.findData('640x480'))
+        self.window.catchup_enabled.setChecked(False)
+        with patch.object(self.module.os, 'kill') as kill:
+            self.window.apply_parameters()
+            kill.assert_called_once()
+        self.assertTrue(self.window.restart_pending)
+        self.assertIsNone(self.window.session_id)
+        process.current = QtCore.QProcess.NotRunning
+        self.window.finished()
+        QtTest.QTest.qWait(20)
+        self.assertFalse(self.window.restart_pending)
+        self.assertEqual(len(process.calls), 1)
+        args = process.calls[0][1]
+        self.assertIn('window_ms:=150', args)
+        self.assertIn('processing_width:=640', args)
+        self.assertIn('processing_height:=480', args)
+        self.assertIn('catchup_enabled:=false', args)
 
 
 if __name__ == '__main__':

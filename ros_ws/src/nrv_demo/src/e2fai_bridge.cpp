@@ -107,10 +107,17 @@ class E2faiBridge {
     if (session_id_.empty()) session_id_ = newSessionId();
     private_nh_.param<std::string>("host", host_, "127.0.0.1");
     private_nh_.param("port", port_, 8765);
+    private_nh_.param("window_ms", window_ms_, 200);
+    private_nh_.param("catchup_enabled", catchup_enabled_, true);
+    private_nh_.param<std::string>("voxel_mode", voxel_mode_, "fixed_window");
     if (!private_nh_.getParam("output_dir", output_dir_)) {
       throw std::runtime_error("Missing output_dir parameter");
     }
-    if (host_ != "127.0.0.1" || port_ < 1 || port_ > 65535) {
+    const std::array<int, 5> supported_windows{{50, 100, 150, 200, 250}};
+    if (host_ != "127.0.0.1" || port_ < 1 || port_ > 65535 ||
+        std::find(supported_windows.begin(), supported_windows.end(), window_ms_) ==
+            supported_windows.end() ||
+        (voxel_mode_ != "event_span" && voxel_mode_ != "fixed_window")) {
       throw std::runtime_error("The host GPU bridge requires 127.0.0.1 and a valid port");
     }
     makeDirectories(output_dir_);
@@ -159,7 +166,10 @@ class E2faiBridge {
                  {"stop_reason", failed ? "failure" : "acquisition_stopped"},
                  {"local_errors", local_errors_}, {"worker_errors", worker_errors_},
                  {"error_code", error_code_}, {"batches", batches_.load()},
-                 {"results", results_.load()}, {"bridge_implementation", "roscpp"}};
+                 {"results", results_.load()}, {"window_ms", window_ms_},
+                 {"catchup_enabled", catchup_enabled_},
+                 {"voxel_mode", voxel_mode_},
+                 {"bridge_implementation", "roscpp"}};
     }
     {
       std::lock_guard<std::mutex> guard(queue_mutex_);
@@ -193,7 +203,9 @@ class E2faiBridge {
       value = {{"session_id", session_id_}, {"state", state_}, {"detail", detail_},
                {"batches", batches_.load()}, {"results", results_.load()},
                {"local_errors", local_errors_}, {"worker_errors", worker_errors_},
-               {"error_code", error_code_}, {"processing_generation", processing_generation_}};
+               {"error_code", error_code_}, {"processing_generation", processing_generation_},
+               {"window_ms", window_ms_}, {"catchup_enabled", catchup_enabled_},
+               {"voxel_mode", voxel_mode_}};
     }
     {
       std::lock_guard<std::mutex> guard(queue_mutex_);
@@ -279,6 +291,9 @@ class E2faiBridge {
                         {"ros_header_seq", message->header.seq}, {"ros_sequence_valid", true},
                         {"header_stamp_ns", message->header.stamp.toNSec()},
                         {"width", message->width}, {"height", message->height},
+                        {"window_ms", window_ms_},
+                        {"catchup_enabled", catchup_enabled_},
+                        {"voxel_mode", voxel_mode_},
                         {"count", batch.count}, {"callback_ns", callback_ns}};
       const uint64_t sequence = batch.sequence, count = batch.count;
       bool overflow = false;
@@ -552,8 +567,9 @@ class E2faiBridge {
   ros::Publisher status_publisher_, result_publisher_;
   ros::Subscriber subscriber_;
   ros::WallTimer timer_;
-  std::string session_id_, host_, output_dir_;
-  int port_{8765};
+  std::string session_id_, host_, output_dir_, voxel_mode_{"fixed_window"};
+  int port_{8765}, window_ms_{200};
+  bool catchup_enabled_{true};
   std::unique_ptr<PerformanceRecorder> perf_;
   std::atomic<bool> stopped_{false}, closed_{false};
   std::atomic<uint64_t> batches_{0}, results_{0};

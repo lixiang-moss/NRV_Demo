@@ -20,6 +20,8 @@ from performance import PerfRecorder
 
 VIEW_SOURCES = [('raw', 'Original rendering'),
                 ('e2fai_gray', 'E2FAI reconstruction'), ('e2fai_flow', 'E2FAI optical flow')]
+WINDOW_OPTIONS_MS = (50, 100, 150, 200, 250)
+RESOLUTION_OPTIONS = ((960, 720), (640, 480), (384, 288))
 
 
 class NoiseWindow(Q.QMainWindow):
@@ -29,6 +31,9 @@ class NoiseWindow(Q.QMainWindow):
         self.resize(1420, 820)
         self.lock = threading.Lock()
         self.frames = {}
+        self.raw_color_table = [QtGui.qRgb(0, 0, 0)] * 256
+        self.raw_color_table[0] = QtGui.qRgb(255, 0, 0)
+        self.raw_color_table[255] = QtGui.qRgb(0, 0, 255)
         self.latest_status = None
         self.last_frame = 0
         self.restart_pending = False
@@ -101,8 +106,44 @@ class NoiseWindow(Q.QMainWindow):
         note.setWordWrap(True)
         form.addRow(note)
         panel.addWidget(hardware)
+        processing = Q.QGroupBox('E2FAI processing')
+        processing_form = Q.QFormLayout(processing)
+        self.window_ms = Q.QComboBox()
+        for value in WINDOW_OPTIONS_MS:
+            self.window_ms.addItem('{} ms'.format(value), value)
+        default_window = int(rospy.get_param('~window_ms', 200))
+        window_index = self.window_ms.findData(default_window)
+        self.window_ms.setCurrentIndex(window_index if window_index >= 0 else self.window_ms.findData(200))
+        self.resolution = Q.QComboBox()
+        for width, height in RESOLUTION_OPTIONS:
+            self.resolution.addItem('{} × {}'.format(width, height), '{}x{}'.format(width, height))
+        default_resolution = (int(rospy.get_param('~processing_width', 960)),
+                              int(rospy.get_param('~processing_height', 720)))
+        resolution_index = self.resolution.findData('{}x{}'.format(*default_resolution))
+        self.resolution.setCurrentIndex(
+            resolution_index if resolution_index >= 0 else self.resolution.findData('960x720'))
+        self.window_ms.setToolTip('Shorter windows reduce collection delay but increase inference frequency.')
+        self.resolution.setToolTip('Changes decoded events, voxel tensors, model outputs and the raw preview.')
+        self.voxel_mode = Q.QComboBox()
+        self.voxel_mode.addItem('Compatibility (event span)', 'event_span')
+        self.voxel_mode.addItem('Incremental (fixed window)', 'fixed_window')
+        default_voxel_mode = rospy.get_param('~voxel_mode', 'fixed_window')
+        voxel_mode_index = self.voxel_mode.findData(default_voxel_mode)
+        self.voxel_mode.setCurrentIndex(
+            voxel_mode_index if voxel_mode_index >= 0 else self.voxel_mode.findData('fixed_window'))
+        self.voxel_mode.setToolTip(
+            'Compatibility keeps the original event-span normalization. Incremental overlaps voxel filling with inference.')
+        self.catchup_enabled = Q.QCheckBox('Automatic catch-up')
+        self.catchup_enabled.setChecked(bool(rospy.get_param('~catchup_enabled', True)))
+        self.catchup_enabled.setToolTip(
+            'Use the 800 ms and 1.5 GiB proactive triggers. Hard limits always discard oldest data and keep running.')
+        processing_form.addRow('Time window', self.window_ms)
+        processing_form.addRow('Processing resolution', self.resolution)
+        processing_form.addRow('Voxel mode', self.voxel_mode)
+        processing_form.addRow('Host queue', self.catchup_enabled)
+        panel.addWidget(processing)
         self.apply_button = Q.QPushButton('Apply parameters')
-        self.apply_button.setToolTip('Apply all edits. Camera bias changes restart acquisition.')
+        self.apply_button.setToolTip('Apply all edits. Processing or camera changes restart acquisition.')
         self.apply_button.clicked.connect(self.apply_parameters)
         self.parameter_status = Q.QLabel('Parameters applied')
         panel.addWidget(self.apply_button)
@@ -162,8 +203,13 @@ class NoiseWindow(Q.QMainWindow):
         if requested_views:
             self.set_profile(dict(bias=self.bias_values(), views=requested_views))
         self.active_bias = self.bias_values()
+        self.active_processing = self.processing_values()
         for control in self.bias.values():
             control.valueChanged.connect(self.update_pending)
+        self.window_ms.currentIndexChanged.connect(self.update_pending)
+        self.resolution.currentIndexChanged.connect(self.update_pending)
+        self.voxel_mode.currentIndexChanged.connect(self.update_pending)
+        self.catchup_enabled.toggled.connect(self.update_pending)
         self.update_pending()
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -176,6 +222,12 @@ class NoiseWindow(Q.QMainWindow):
 
     def visible_views(self):
         return [key for key, _ in VIEW_SOURCES if self.view_actions[key].isChecked()]
+
+    def processing_values(self):
+        width, height = self.resolution.currentData().split('x')
+        return dict(window_ms=int(self.window_ms.currentData()), width=int(width), height=int(height),
+                    voxel_mode=str(self.voxel_mode.currentData()),
+                    catchup_enabled=self.catchup_enabled.isChecked())
 
     def relayout_views(self):
         while self.view_grid.count():
@@ -202,10 +254,12 @@ class NoiseWindow(Q.QMainWindow):
     def persist_applied_profile(self):
         self.profile_path.parent.mkdir(parents=True, exist_ok=True)
         self.profile_path.write_text(json.dumps(dict(bias=self.active_bias,
+                                                     processing=self.active_processing,
                                                      views=self.visible_views()), indent=2) + '\n')
 
     def update_pending(self):
-        pending = self.bias_values() != self.active_bias
+        pending = (self.bias_values() != self.active_bias
+                   or self.processing_values() != self.active_processing)
         self.apply_button.setEnabled(pending)
         self.parameter_status.setText('Pending changes — click Apply parameters' if pending else 'Parameters applied')
         self.parameter_status.setWordWrap(True)
@@ -227,7 +281,12 @@ class NoiseWindow(Q.QMainWindow):
         settings = self.write_settings()
         self.session_id = uuid.uuid4().hex
         args = ['nrv_demo', 'demo.launch', 'show_gui:=false', 'sensor_setting_path:=' + str(settings),
-                'session_id:=' + self.session_id]
+                'session_id:=' + self.session_id,
+                'window_ms:=' + str(self.active_processing['window_ms']),
+                'processing_width:=' + str(self.active_processing['width']),
+                'processing_height:=' + str(self.active_processing['height']),
+                'voxel_mode:=' + self.active_processing['voxel_mode'],
+                'catchup_enabled:=' + str(self.active_processing['catchup_enabled']).lower()]
         for name in ('serial_number', 'device_index', 'duration', 'output_dir', 'message_threshold_time_ms', 'image_fps'):
             args.append(name + ':=' + str(rospy.get_param('~' + name)))
         for name, default in (('e2fai_enabled', True), ('e2fai_host', '127.0.0.1'),
@@ -275,12 +334,14 @@ class NoiseWindow(Q.QMainWindow):
 
     def apply_parameters(self):
         bias_changed = self.bias_values() != self.active_bias
+        processing_changed = self.processing_values() != self.active_processing
         self.active_bias = self.bias_values()
+        self.active_processing = self.processing_values()
         self.write_settings()
         self.persist_applied_profile()
         self.update_pending()
-        if bias_changed and self.process.state() != QtCore.QProcess.NotRunning:
-            self.log.appendPlainText('Applying camera parameters: restarting acquisition.')
+        if (bias_changed or processing_changed) and self.process.state() != QtCore.QProcess.NotRunning:
+            self.log.appendPlainText('Applying parameters: restarting acquisition and model state.')
             self.restart_pending = True
             self.interrupt()
         else:
@@ -356,6 +417,21 @@ class NoiseWindow(Q.QMainWindow):
                 self.model_generation = generation
                 self.latest_model_status = status
 
+    def _image_from_message(self, message, key):
+        if key == 'raw' and message.encoding == 'mono8':
+            image = QtGui.QImage(bytes(message.data), message.width, message.height,
+                                 message.step, QtGui.QImage.Format_Indexed8).copy()
+            image.setColorTable(self.raw_color_table)
+            return image
+        formats = {'bgr8': QtGui.QImage.Format_RGB888,
+                   'rgb8': QtGui.QImage.Format_RGB888,
+                   'mono8': QtGui.QImage.Format_Grayscale8}
+        if message.encoding not in formats:
+            return None
+        image = QtGui.QImage(bytes(message.data), message.width, message.height,
+                             message.step, formats[message.encoding]).copy()
+        return image.rgbSwapped() if message.encoding == 'bgr8' else image
+
     def refresh(self):
         if self.perf.enabled:
             refresh_ns = self.perf.tick()
@@ -380,15 +456,10 @@ class NoiseWindow(Q.QMainWindow):
                 continue
             self.perf.elapsed('receive_to_refresh', received, source=key, **metadata)
             tick = self.perf.tick()
-            formats = {'bgr8': QtGui.QImage.Format_RGB888, 'rgb8': QtGui.QImage.Format_RGB888,
-                       'mono8': QtGui.QImage.Format_Grayscale8}
-            if message.encoding not in formats:
+            image = self._image_from_message(message, key)
+            if image is None:
                 self.log.appendPlainText('Unsupported image encoding: ' + message.encoding)
                 continue
-            image = QtGui.QImage(bytes(message.data), message.width, message.height,
-                                 message.step, formats[message.encoding]).copy()
-            if message.encoding == 'bgr8':
-                image = image.rgbSwapped()
             view = self.views[key]
             pixmap = QtGui.QPixmap.fromImage(image).scaled(view.contentsRect().size(), QtCore.Qt.KeepAspectRatio,
                                                          QtCore.Qt.SmoothTransformation)
@@ -417,7 +488,12 @@ class NoiseWindow(Q.QMainWindow):
                 text += '   ' + model_status['detail']
             self.model_status.setText(text)
         if self.process.state() == QtCore.QProcess.Running and not self.stopping:
-            self.state.setText('Streaming' if last and time.monotonic() - last < 2 else
+            active = '{} ms, {} × {}'.format(
+                self.active_processing['window_ms'], self.active_processing['width'],
+                self.active_processing['height'])
+            active += ', {}'.format('incremental voxel' if self.active_processing['voxel_mode'] == 'fixed_window'
+                                    else 'compatibility voxel')
+            self.state.setText(('Streaming — ' + active) if last and time.monotonic() - last < 2 else
                                'Waiting for data (check the camera and log below)')
         if status:
             self.metrics.setText('RAW: {:.2f} MB/s   Packets: {:,}   RAW gaps: {}'.format(
@@ -427,11 +503,29 @@ class NoiseWindow(Q.QMainWindow):
         path, _ = Q.QFileDialog.getSaveFileName(self, 'Save profile', str(self.output / 'camera_profile.json'), 'JSON (*.json)')
         if path:
             Path(path).write_text(json.dumps(dict(bias={a: w.value() for a, w in self.bias.items()},
+                                               processing=self.processing_values(),
                                                views=self.visible_views()), indent=2) + '\n')
 
     def set_profile(self, config):
         if not isinstance(config, dict):
             raise ValueError('Profile must be a JSON object')
+        processing = config.get('processing')
+        if processing is not None:
+            if not isinstance(processing, dict):
+                raise ValueError('processing must be an object')
+            try:
+                window_ms = int(processing['window_ms'])
+                resolution = (int(processing['width']), int(processing['height']))
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError('processing requires integer window_ms, width and height') from error
+            if window_ms not in WINDOW_OPTIONS_MS or resolution not in RESOLUTION_OPTIONS:
+                raise ValueError('processing contains an unsupported window or resolution')
+            catchup_enabled = processing.get('catchup_enabled', self.catchup_enabled.isChecked())
+            if type(catchup_enabled) is not bool:
+                raise ValueError('processing catchup_enabled must be a boolean')
+            voxel_mode = processing.get('voxel_mode', self.voxel_mode.currentData())
+            if voxel_mode not in ('event_span', 'fixed_window'):
+                raise ValueError('processing voxel_mode must be event_span or fixed_window')
         visible = config.get('views', [key for key, _ in VIEW_SOURCES])
         if not isinstance(visible, list) or any(not isinstance(key, str) for key in visible):
             raise ValueError('views must be a list of image sources')
@@ -444,6 +538,12 @@ class NoiseWindow(Q.QMainWindow):
             raise ValueError('views must contain one to three distinct known image sources')
         for address, widget in self.bias.items():
             widget.setValue(config['bias'][address])
+        if processing is not None:
+            self.window_ms.setCurrentIndex(self.window_ms.findData(window_ms))
+            self.resolution.setCurrentIndex(
+                self.resolution.findData('{}x{}'.format(*resolution)))
+            self.voxel_mode.setCurrentIndex(self.voxel_mode.findData(voxel_mode))
+            self.catchup_enabled.setChecked(catchup_enabled)
         for key, action in self.view_actions.items():
             action.blockSignals(True)
             action.setChecked(key in visible)

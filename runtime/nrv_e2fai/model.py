@@ -165,11 +165,18 @@ class FrozenFlowRecurrentImageE2FAI(nn.Module):
         recurrent_channels: int = 32,
         num_bins: int = 15,
         flow_tile_size: int = 16,
+        supported_resolutions: tuple[tuple[int, int], ...] | None = None,
     ):
         super().__init__()
-        if sensor_height % flow_tile_size or sensor_width % flow_tile_size:
-            raise ValueError("Sensor dimensions must be divisible by 16")
+        resolutions = supported_resolutions or ((sensor_width, sensor_height),)
+        resolutions = tuple(dict.fromkeys((int(width), int(height)) for width, height in resolutions))
+        if (sensor_width, sensor_height) not in resolutions:
+            resolutions = ((sensor_width, sensor_height),) + resolutions
+        if any(min(width, height) <= 0 or width % flow_tile_size or height % flow_tile_size
+               for width, height in resolutions):
+            raise ValueError("All sensor dimensions must be positive and divisible by 16")
         self.sensor_height, self.sensor_width, self.num_bins = sensor_height, sensor_width, num_bins
+        self.supported_resolutions = frozenset(resolutions)
         self.backbone = UNet(num_bins, 3)
         checkpoint = torch.load(Path(backbone_checkpoint), map_location="cpu")
         state = checkpoint.get("state_dict", checkpoint)
@@ -179,10 +186,11 @@ class FrozenFlowRecurrentImageE2FAI(nn.Module):
         self.backbone.requires_grad_(False).eval()
         self.image_adapter = RecurrentImageResidual(recurrent_channels)
         self.flow_pool = nn.AvgPool2d(flow_tile_size)
-        self.flow_interpolation = DenseFlowInterpolation(
-            sensor_height // flow_tile_size, sensor_width // flow_tile_size,
-            sensor_height, sensor_width,
-        )
+        self.flow_interpolations = nn.ModuleDict({
+            '{}x{}'.format(width, height): DenseFlowInterpolation(
+                height // flow_tile_size, width // flow_tile_size, height, width)
+            for width, height in resolutions
+        })
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -190,9 +198,11 @@ class FrozenFlowRecurrentImageE2FAI(nn.Module):
         return self
 
     def forward_step(self, voxel: torch.Tensor, state: torch.Tensor | None = None):
-        expected = (self.num_bins, self.sensor_height, self.sensor_width)
-        if voxel.ndim != 4 or tuple(voxel.shape[1:]) != expected:
-            raise ValueError(f"Expected voxel [B,{expected}], got {tuple(voxel.shape)}")
+        if voxel.ndim != 4 or voxel.shape[1] != self.num_bins:
+            raise ValueError(f"Expected voxel [B,{self.num_bins},H,W], got {tuple(voxel.shape)}")
+        height, width = int(voxel.shape[2]), int(voxel.shape[3])
+        if (width, height) not in self.supported_resolutions:
+            raise ValueError(f"Unsupported model resolution: {width}x{height}")
         with torch.no_grad():
             x1 = self.backbone.inc(voxel)
             x2 = self.backbone.down1(x1)
@@ -204,7 +214,7 @@ class FrozenFlowRecurrentImageE2FAI(nn.Module):
             decoded = self.backbone.up3(feature, x2)
             decoded = self.backbone.up4(decoded, x1)
             raw = self.backbone.outc(decoded)
-        flow = self.flow_interpolation(self.flow_pool(raw[:, :2]))
+        flow = self.flow_interpolations['{}x{}'.format(width, height)](self.flow_pool(raw[:, :2]))
         raw_residual, state = self.image_adapter(feature, state)
         residual = raw_residual - raw_residual.mean(dim=(-2, -1), keepdim=True)
         log_image = raw[:, 2:3] + residual

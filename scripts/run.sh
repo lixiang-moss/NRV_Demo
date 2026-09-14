@@ -5,6 +5,11 @@ SHOW_GUI="${SHOW_GUI:-true}"
 DECODE_EVENTS="${DECODE_EVENTS:-true}"
 E2FAI_ENABLED="${E2FAI_ENABLED:-true}"
 PERF_ENABLED="${PERF_ENABLED:-false}"
+WINDOW_MS="${WINDOW_MS:-200}"
+PROCESSING_WIDTH="${PROCESSING_WIDTH:-960}"
+PROCESSING_HEIGHT="${PROCESSING_HEIGHT:-720}"
+CATCHUP_ENABLED="${CATCHUP_ENABLED:-true}"
+E2FAI_VOXEL_MODE="${E2FAI_VOXEL_MODE:-fixed_window}"
 [ "${DECODE_EVENTS}" = true ] || E2FAI_ENABLED=false
 
 if ! docker image inspect nrv-demo:noetic >/dev/null 2>&1; then
@@ -47,14 +52,17 @@ fi
 if [ "${E2FAI_ENABLED}" = true ]; then
   python_bin="${E2FAI_PYTHON:-${HOME}/miniconda3/envs/nrv-e2fai/bin/python}"
   [ -x "${python_bin}" ] || { echo 'Model environment missing. Run scripts/setup_e2fai.sh or set E2FAI_PYTHON.' >&2; exit 1; }
-  host_args=(--host 127.0.0.1 --port "${E2FAI_PORT:-8765}" --window-ms "${WINDOW_MS:-250}"
+  host_args=(--host 127.0.0.1 --port "${E2FAI_PORT:-8765}" --window-ms "${WINDOW_MS}"
     --result-mode "${E2FAI_RESULT_MODE:-thread}"
+    --voxel-mode "${E2FAI_VOXEL_MODE}"
     --queue-batches "${E2FAI_QUEUE_BATCHES:-256}"
     --backbone "${BACKBONE_CHECKPOINT:-${project_dir}/checkpoints/e2fai_backbone.ckpt}"
     --image-checkpoint "${IMAGE_CHECKPOINT:-${project_dir}/checkpoints/image_residual_epoch043.pt}"
+    --sensor-width "${PROCESSING_WIDTH}" --sensor-height "${PROCESSING_HEIGHT}"
     --device "${E2FAI_DEVICE:-cuda:0}" --output-dir "${run_dir}")
   [ "${PERF_ENABLED}" != true ] || host_args+=(--perf-enabled)
   [ "${E2FAI_FRESHNESS:-true}" != false ] || host_args+=(--no-freshness)
+  [ "${CATCHUP_ENABLED}" != false ] || host_args+=(--no-catchup)
   PYTHONNOUSERSITE=1 "${python_bin}" "${project_dir}/examples/e2fai_worker.py" "${host_args[@]}" >"${run_dir}/host.log" 2>&1 &
   host_pid=$!
   for _ in $(seq 1 480); do
@@ -78,6 +86,9 @@ docker compose -f "${project_dir}/compose.yaml" run --rm --name "${container_nam
   "show_gui:=${SHOW_GUI}" "decode_events:=${DECODE_EVENTS}" \
   "duration:=${DURATION:-0}" "output_dir:=${container_output}" \
   "e2fai_enabled:=${E2FAI_ENABLED}" "e2fai_port:=${E2FAI_PORT:-8765}" "perf_enabled:=${PERF_ENABLED}" \
+  "window_ms:=${WINDOW_MS}" "processing_width:=${PROCESSING_WIDTH}" \
+  "processing_height:=${PROCESSING_HEIGHT}" "catchup_enabled:=${CATCHUP_ENABLED}" \
+  "voxel_mode:=${E2FAI_VOXEL_MODE}" \
   "$@" || launch_status=$?
 
 # Flush the model session before evaluating the complete integration.

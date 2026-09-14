@@ -12,6 +12,11 @@
   <arg name="e2fai_enabled" default="true" />
   <arg name="e2fai_host" default="127.0.0.1" />
   <arg name="e2fai_port" default="8765" />
+  <arg name="window_ms" default="200" />
+  <arg name="processing_width" default="960" />
+  <arg name="processing_height" default="720" />
+  <arg name="catchup_enabled" default="true" />
+  <arg name="voxel_mode" default="fixed_window" />
   <arg name="session_id" default="" />
   <arg name="perf_enabled" default="false" />
   <arg name="perf_interval_s" default="5" />
@@ -32,6 +37,11 @@
     <param name="e2fai_enabled" value="$(arg e2fai_enabled)" />
     <param name="e2fai_host" value="$(arg e2fai_host)" />
     <param name="e2fai_port" value="$(arg e2fai_port)" />
+    <param name="window_ms" value="$(arg window_ms)" />
+    <param name="processing_width" value="$(arg processing_width)" />
+    <param name="processing_height" value="$(arg processing_height)" />
+    <param name="catchup_enabled" value="$(arg catchup_enabled)" />
+    <param name="voxel_mode" value="$(arg voxel_mode)" />
     <param name="perf_enabled" value="$(arg perf_enabled)" />
     <param name="perf_interval_s" value="$(arg perf_interval_s)" />
     <param name="perf_capacity" value="$(arg perf_capacity)" />

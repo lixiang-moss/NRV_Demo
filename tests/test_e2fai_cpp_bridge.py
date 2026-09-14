@@ -63,7 +63,8 @@ def run_probe():
             process = subprocess.Popen([
                 "rosrun", "nrv_demo", "e2fai_bridge", "_session_id:=interop-session",
                 "_host:=127.0.0.1", "_port:=" + str(server.getsockname()[1]),
-                "_output_dir:=" + directory, "_perf_enabled:=false"
+                "_output_dir:=" + directory, "_perf_enabled:=false", "_window_ms:=100",
+                "_catchup_enabled:=false"
             ], stdout=log, stderr=subprocess.STDOUT)
             connection, _ = server.accept()
             wait_for(lambda: publisher.get_num_connections() > 0 and result_sub.get_num_connections() > 0,
@@ -89,6 +90,8 @@ def run_probe():
             assert metadata["ros_header_seq"] == published_ros_sequence and metadata["ros_sequence_valid"] is True, metadata
             assert metadata["header_stamp_ns"] == stamp, metadata
             assert metadata["width"] == 960 and metadata["height"] == 720, metadata
+            assert metadata["window_ms"] == 100, metadata
+            assert metadata["catchup_enabled"] is False, metadata
             assert bytes(payload) == original.tobytes(), "Event bytes or integer timestamps changed"
 
             gray = bytes([1, 2, 3, 4])
@@ -131,6 +134,8 @@ def run_probe():
             assert summary["worker_errors"] == 1 and summary["local_errors"] == 0, summary
             assert summary["error_code"] == "probe_stop" and summary["stop_reason"] == "failure", summary
             assert summary["batches"] == 1 and summary["results"] == 2, summary
+            assert summary["window_ms"] == 100, summary
+            assert summary["catchup_enabled"] is False, summary
             assert not list(output.glob("performance_*.jsonl")), "Disabled measurement wrote a file"
             print("CPP_BRIDGE_INTEROP " + json.dumps({"status": "PASS", "original_events_exact": True,
                   "integer_metadata_exact": True, "result_payloads_exact": True,
@@ -148,7 +153,8 @@ def run_probe():
             process = subprocess.Popen([
                 'rosrun', 'nrv_demo', 'e2fai_bridge', '_session_id:=overflow-session',
                 '_host:=127.0.0.1', '_port:=' + str(server.getsockname()[1]),
-                '_output_dir:=' + directory, '_perf_enabled:=false'
+                '_output_dir:=' + directory, '_perf_enabled:=false', '_window_ms:=250',
+                '_catchup_enabled:=true'
             ], stdout=log, stderr=subprocess.STDOUT)
             wait_for(lambda: publisher.get_num_connections() > 0, 'new event subscriber')
             for _ in range(34):
@@ -165,6 +171,7 @@ def run_probe():
             assert [p[1]['batch_seq'] for p in retained] == list(range(17, 34)), retained
             assert all(p[1]['bridge_generation'] == 1 and bytes(p[2]) == original.tobytes()
                        for p in retained), 'Retained events changed or lost the recovery marker'
+            assert all(p[1]['window_ms'] == 250 for p in retained), retained
             send_packet(connection, 'result', dict(output_meta, session_id='overflow-session',
                         bridge_generation=0), gray + color + flow)
             send_packet(connection, 'result', dict(output_meta, session_id='overflow-session',
@@ -176,6 +183,8 @@ def run_probe():
             recovered = json.loads((output / 'bridge_summary.json').read_text())
             assert recovered['local_errors'] == recovered['worker_errors'] == 0, recovered
             assert recovered['catchup_discarded_batches'] == 17 and recovered['results'] == 1, recovered
+            assert recovered['window_ms'] == 250, recovered
+            assert recovered['catchup_enabled'] is True, recovered
             print('CPP_BRIDGE_CATCHUP ' + json.dumps(recovered), flush=True)
             result_sub.unregister()
             status_sub.unregister()

@@ -21,7 +21,8 @@ class ModelParityTests(unittest.TestCase):
         backbone = ROOT / "checkpoints/e2fai_backbone.ckpt"
         adapter = ROOT / "checkpoints/image_residual_epoch043.pt"
         actual, metadata = load_recurrent_model(adapter, backbone_checkpoint=backbone,
-                                                device="cpu", sensor_height=32, sensor_width=48)
+                                                device="cpu", sensor_height=32, sensor_width=48,
+                                                supported_resolutions=((48, 32), (64, 48)))
         source = subprocess.check_output(["git", "show", "7d2fb86:runtime/nrv_e2fai/model.py"], cwd=ROOT, text=True)
         module = types.ModuleType("reference_e2fai_model")
         exec(compile(source, "7d2fb86_model", "exec"), module.__dict__)
@@ -43,6 +44,11 @@ class ModelParityTests(unittest.TestCase):
                     torch.testing.assert_close(actual_output[key], expected_output[key], rtol=0, atol=0)
                 torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
                 self.assertEqual(actual_output["flow"].shape, (1, 2, 32, 48))
+            resized_output, resized_state = actual.forward_step(
+                torch.randn(1, 15, 48, 64, generator=rng), None)
+        self.assertEqual(resized_output["flow"].shape, (1, 2, 48, 64))
+        self.assertEqual(resized_output["log_image"].shape, (1, 1, 48, 64))
+        self.assertEqual(resized_state.shape[-2:], (12, 16))
 
 
 if __name__ == "__main__":

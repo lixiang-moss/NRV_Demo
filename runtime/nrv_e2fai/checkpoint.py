@@ -27,6 +27,7 @@ def load_recurrent_model(
     device: str | torch.device,
     sensor_height: int,
     sensor_width: int,
+    supported_resolutions: tuple[tuple[int, int], ...] | None = None,
 ):
     adapter_path, backbone_path = Path(adapter_checkpoint), Path(backbone_checkpoint)
     for path in (adapter_path, backbone_path):
@@ -50,7 +51,8 @@ def load_recurrent_model(
         raise ValueError("Invalid image residual projection.weight")
 
     model = FrozenFlowRecurrentImageE2FAI(
-        backbone_path, sensor_height, sensor_width, int(projection.shape[0])
+        backbone_path, sensor_height, sensor_width, int(projection.shape[0]),
+        supported_resolutions=supported_resolutions,
     )
     model.image_adapter.load_state_dict(adapter_state, strict=True)
     model.to(device).eval()

@@ -47,25 +47,29 @@ class QueueTests(unittest.TestCase):
     def test_capacity_catchup_trims_whole_prefix_before_insertion(self):
         mib = 1024 * 1024
         fifo = BoundedEventQueue()
-        for seq in range(3):
+        for seq in range(5):
             fifo.trim(1, (self.batch(seq, 1), 256 * mib))
-        reason, dropped = fifo.trim(1, (self.batch(3, 1), 256 * mib))
+        reason, dropped = fifo.trim(1, (self.batch(5, 1), 256 * mib))
         self.assertEqual(reason, 'queue_capacity')
-        self.assertEqual(dropped, [2, 6, 512 * mib])
+        self.assertEqual(dropped, [4, 12, 1024 * mib])
         self.assertEqual(fifo.bytes, 512 * mib)
-        self.assertEqual([fifo.get()[1]['batch_seq'] for _ in range(2)], [2, 3])
-        reason, dropped = fifo.trim(1, (self.batch(4, 1), 2048 * mib + 1))
+        self.assertEqual([fifo.get()[1]['batch_seq'] for _ in range(2)], [4, 5])
+        reason, dropped = fifo.trim(1, (self.batch(6, 1), 2048 * mib + 1))
         self.assertEqual(dropped[0], 1)
         self.assertEqual(fifo.bytes, 0)
         self.assertLess(fifo.peak_bytes, 2048 * mib)
 
     def test_freshness_uses_callback_age_and_retains_recent_suffix(self):
         fifo = BoundedEventQueue()
-        for seq, callback in enumerate((0, 300_000_000, 400_000_000)):
+        for seq, callback in enumerate((0, 500_000_000, 600_000_000)):
             fifo.put(self.batch(seq, callback), 39)
-        reason, dropped = fifo.trim(600_000_000)
+        reason, dropped = fifo.trim(800_000_000)
+        self.assertIsNone(reason)
+        self.assertEqual(dropped, [0, 0, 0])
+        reason, dropped = fifo.trim(800_000_001)
         self.assertEqual(reason, 'queue_freshness')
-        self.assertEqual(dropped, [2, 6, 78])
+        self.assertEqual(dropped, [1, 3, 39])
+        self.assertEqual(fifo.get()[1]['batch_seq'], 1)
         self.assertEqual(fifo.get()[1]['batch_seq'], 2)
         # A just-received TCP packet can still be old at the source callback.
         _, dropped = fifo.trim(800_000_001, (self.batch(3, 0), 39))
@@ -84,14 +88,23 @@ class QueueTests(unittest.TestCase):
     def test_window_and_preview_scale_defaults_and_override(self):
         required = ["--backbone", "backbone.ckpt", "--image-checkpoint", "image.pt", "--output-dir", "/tmp/unused"]
         args = parse_args(required)
-        self.assertEqual((args.window_ms, args.flow_max_px, args.result_mode), (250.0, 50.0, "thread"))
+        self.assertEqual((args.window_ms, args.flow_max_px, args.result_mode), (200.0, 40.0, "thread"))
+        self.assertEqual((args.sensor_width, args.sensor_height), (960, 720))
         self.assertEqual(parse_args(required + ["--result-mode", "inline"]).result_mode, "inline")
         self.assertEqual(args.queue_batches, 256)
         self.assertTrue(args.freshness)
+        self.assertTrue(args.catchup_enabled)
         self.assertFalse(parse_args(required + ["--no-freshness"]).freshness)
+        self.assertFalse(parse_args(required + ["--no-catchup"]).catchup_enabled)
         self.assertEqual(parse_args(required + ["--queue-batches", "128"]).queue_batches, 128)
         self.assertEqual(parse_args(required + ["--window-ms", "100"]).flow_max_px, 20.0)
         self.assertEqual(parse_args(required + ["--flow-max-px", "7"]).flow_max_px, 7.0)
+        for value in (50, 100, 150, 200, 250):
+            self.assertEqual(parse_args(required + ["--window-ms", str(value)]).window_ms, value)
+        for width, height in ((960, 720), (640, 480), (384, 288)):
+            parsed = parse_args(required + ["--sensor-width", str(width),
+                                            "--sensor-height", str(height)])
+            self.assertEqual((parsed.sensor_width, parsed.sensor_height), (width, height))
 
     def test_capacity_failure_does_not_replace_older_item(self):
         fifo = BoundedEventQueue(max_batches=2, max_bytes=20)
@@ -107,7 +120,7 @@ class QueueTests(unittest.TestCase):
         fifo = BoundedEventQueue()
         for index in range(256):
             fifo.put(index, 1)
-        with self.assertRaisesRegex(OverflowError, "256 batches / 2048 MiB"):
+        with self.assertRaisesRegex(OverflowError, "256 batches / 4096 MiB"):
             fifo.put(256, 1)
         self.assertEqual([fifo.get() for _ in range(256)], list(range(256)))
 
@@ -117,15 +130,15 @@ class QueueTests(unittest.TestCase):
             fifo.put("large", 11)
         self.assertIsNone(fifo.get())
 
-    def test_default_byte_capacity_accepts_two_gib_and_rejects_next_byte(self):
+    def test_default_byte_capacity_accepts_four_gib_and_rejects_next_byte(self):
         fifo = BoundedEventQueue()
-        self.assertEqual(fifo.max_bytes, 2 * 1024 * 1024 * 1024)
-        # Exercise size accounting without allocating two gigabytes of test data.
-        fifo.put("first", 1024 * 1024 * 1024)
-        fifo.put("second", 1024 * 1024 * 1024)
-        with self.assertRaisesRegex(OverflowError, "2048 MiB"):
+        self.assertEqual(fifo.max_bytes, 4 * 1024 * 1024 * 1024)
+        # Exercise size accounting without allocating four gigabytes of test data.
+        for index in range(4):
+            fifo.put(index, 1024 * 1024 * 1024)
+        with self.assertRaisesRegex(OverflowError, "4096 MiB"):
             fifo.put("overflow", 1)
-        self.assertEqual([fifo.get(), fifo.get()], ["first", "second"])
+        self.assertEqual([fifo.get() for _ in range(4)], list(range(4)))
         self.assertEqual(fifo.bytes, 0)
 
     def test_invalid_event_size_and_polarity_are_explicit(self):
@@ -134,6 +147,14 @@ class QueueTests(unittest.TestCase):
             validate_events(meta, array.tobytes()[:-1])
         array["polarity"][0] = 2
         with self.assertRaises(ProtocolError):
+            validate_events(meta, array.tobytes())
+        meta, array = input_packet()
+        meta["window_ms"] = 0
+        with self.assertRaisesRegex(ProtocolError, "positive integer"):
+            validate_events(meta, array.tobytes())
+        meta, array = input_packet()
+        meta["catchup_enabled"] = 1
+        with self.assertRaisesRegex(ProtocolError, "boolean"):
             validate_events(meta, array.tobytes())
 
 
@@ -350,6 +371,50 @@ class SessionTests(unittest.TestCase):
         finally:
             receiver.close()
             client.close()
+
+    def test_window_or_resolution_change_requires_a_new_connection(self):
+        for changed in (dict(window_ms=150), dict(width=64, height=48),
+                        dict(catchup_enabled=False)):
+            with self.subTest(changed=changed):
+                host, client = socket.socketpair()
+                receiver = SessionReceiver(host, self.perf)
+                try:
+                    meta, array = input_packet()
+                    meta.update(window_ms=100, catchup_enabled=True)
+                    send_packet(client, "events", meta, array.tobytes())
+                    meta, array = input_packet(batch=1)
+                    meta.update(window_ms=100, catchup_enabled=True)
+                    meta.update(changed)
+                    send_packet(client, "events", meta, array.tobytes())
+                    kind, error, _ = recv_packet(client)
+                    self.assertEqual(kind, "error")
+                    self.assertEqual(error["code"], "protocol_or_connection_error")
+                    self.assertIn("cannot change window, resolution or catch-up mode", error["message"])
+                finally:
+                    receiver.close()
+                    client.close()
+
+    def test_disabled_catchup_ignores_proactive_threshold_but_hard_limit_trims(self):
+        mib = 1024 * 1024
+        fifo = BoundedEventQueue(max_batches=1000)
+
+        def batch(sequence):
+            metadata, events = input_packet(batch=sequence)
+            metadata["callback_ns"] = 1
+            return events, metadata, 1
+
+        for sequence in range(15):
+            reason, dropped = fifo.trim(
+                1, (batch(sequence), 256 * mib), proactive=False)
+            self.assertIsNone(reason)
+            self.assertEqual(dropped, [0, 0, 0])
+        self.assertEqual(fifo.bytes, 3840 * mib)
+        reason, dropped = fifo.trim(
+            1, (batch(15), 256 * mib), proactive=False)
+        self.assertEqual(reason, "queue_capacity")
+        self.assertEqual(dropped, [14, 42, 3584 * mib])
+        self.assertEqual(fifo.bytes, 512 * mib)
+        self.assertEqual([fifo.get()[1]["batch_seq"] for _ in range(2)], [14, 15])
 
     def test_time_discontinuity_resets_gru_before_next_segment(self):
         model = FakeModel()

@@ -12,6 +12,11 @@
   <arg name="e2fai_enabled" default="true" />
   <arg name="e2fai_host" default="127.0.0.1" />
   <arg name="e2fai_port" default="8765" />
+  <arg name="window_ms" default="200" />
+  <arg name="processing_width" default="960" />
+  <arg name="processing_height" default="720" />
+  <arg name="catchup_enabled" default="true" />
+  <arg name="voxel_mode" default="fixed_window" />
   <arg name="session_id" default="$(anon session)" />
   <arg name="perf_enabled" default="false" />
   <arg name="perf_interval_s" default="5" />
@@ -37,22 +42,23 @@
         <param name="input_topic" value="/delta_driver/events" />
         <param name="output_topic" value="events" />
         <param name="camera_info_topic" value="camera_info" />
+        <param name="image_topic" value="/delta_renderer/image" />
+        <param name="image_fps" value="$(arg image_fps)" />
+        <param name="processing_width" value="$(arg processing_width)" />
+        <param name="processing_height" value="$(arg processing_height)" />
         <param name="perf_enabled" value="$(arg perf_enabled)" />
         <param name="perf_output_dir" value="$(arg output_dir)" />
         <param name="perf_interval_s" value="$(arg perf_interval_s)" />
         <param name="perf_capacity" value="$(arg perf_capacity)" />
       </node>
     </group>
-    <node name="delta_renderer" pkg="nodelet" type="nodelet"
-          args="load delta_tools/RendererNodelet /delta_manager" output="screen">
-      <param name="topic" value="/delta_driver/events" />
-      <param name="image_fps" value="$(arg image_fps)" />
-      <param name="subscriber_queue_size" value="1" />
-    </node>
     <node if="$(arg e2fai_enabled)" name="nrv_e2fai" pkg="nrv_demo" type="e2fai_bridge" output="screen">
       <param name="host" value="$(arg e2fai_host)" />
       <param name="port" value="$(arg e2fai_port)" />
       <param name="session_id" type="str" value="$(arg session_id)" />
+      <param name="window_ms" value="$(arg window_ms)" />
+      <param name="catchup_enabled" value="$(arg catchup_enabled)" />
+      <param name="voxel_mode" value="$(arg voxel_mode)" />
       <param name="perf_enabled" value="$(arg perf_enabled)" />
       <param name="perf_interval_s" value="$(arg perf_interval_s)" />
       <param name="perf_capacity" value="$(arg perf_capacity)" />

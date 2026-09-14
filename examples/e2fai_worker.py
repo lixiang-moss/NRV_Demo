@@ -25,16 +25,20 @@ import torch
 
 from e2fai_protocol import EVENT_DTYPE, ProtocolError, recv_packet, send_packet
 from nrv_e2fai import load_recurrent_model
-from nrv_e2fai.preprocessing import EventWindowBuffer, NUM_BINS, RunningRange, voxelize
+from nrv_e2fai.incremental_voxelizer import IncrementalVoxelizer
+from nrv_e2fai.preprocessing import (EventWindowBuffer, IncrementalWindowRouter,
+                                     NUM_BINS, RunningRange, voxelize)
 from nrv_e2fai.visualization import flow_hsv_rgb
 from performance import PerfRecorder
 
 DEFAULT_QUEUE_BATCHES = 256
-DEFAULT_QUEUE_BYTES = 2 * 1024 * 1024 * 1024
-QUEUE_TRIGGER_BYTES = 1024 * 1024 * 1024
+DEFAULT_QUEUE_BYTES = 4 * 1024 * 1024 * 1024
+QUEUE_TRIGGER_BYTES = 1536 * 1024 * 1024
 QUEUE_TARGET_BYTES = 512 * 1024 * 1024
-WAIT_LIMIT_NS = 500_000_000
-WAIT_TARGET_NS = 250_000_000
+WAIT_LIMIT_NS = 800_000_000
+WAIT_TARGET_NS = 400_000_000
+WINDOW_OPTIONS_MS = (50, 100, 150, 200, 250)
+RESOLUTION_OPTIONS = ((960, 720), (640, 480), (384, 288))
 
 
 class BoundedEventQueue:
@@ -83,7 +87,7 @@ class BoundedEventQueue:
                         source_span_ns=(int(event_parts[-1]["timestamp_ns"][-1])
                                         - int(event_parts[0]["timestamp_ns"][0])) if event_parts else 0)
 
-    def trim(self, now, incoming=None, freshness=True, catching_up=False):
+    def trim(self, now, incoming=None, freshness=True, catching_up=False, proactive=True):
         """Trim BEFORE insertion. Return reason and discarded batch/event/byte counts.
 
         Retain a contiguous suffix, including the incoming batch if it fits.
@@ -97,9 +101,10 @@ class BoundedEventQueue:
                 candidates.append(incoming)
                 total += incoming[1]
             oldest_age = now - candidates[0][0][1]["callback_ns"] if candidates else 0
-            reason = ("queue_capacity" if total >= min(QUEUE_TRIGGER_BYTES, self.max_bytes)
+            capacity_trigger = min(QUEUE_TRIGGER_BYTES, self.max_bytes) if proactive else self.max_bytes
+            reason = ("queue_capacity" if total >= capacity_trigger
                       or len(candidates) >= self.max_batches else
-                      "queue_freshness" if freshness and oldest_age > WAIT_LIMIT_NS else None)
+                      "queue_freshness" if proactive and freshness and oldest_age > WAIT_LIMIT_NS else None)
             discarded = [0, 0, 0]
             if reason or catching_up:
                 target_bytes = min(QUEUE_TARGET_BYTES, self.max_bytes)
@@ -144,6 +149,12 @@ def validate_events(metadata, payload):
         raise ProtocolError("ros_sequence_valid must be a boolean")
     if not 0 < metadata["width"] <= 65535 or not 0 < metadata["height"] <= 65535:
         raise ProtocolError("Invalid event resolution")
+    if "window_ms" in metadata and (type(metadata["window_ms"]) is not int or metadata["window_ms"] <= 0):
+        raise ProtocolError("window_ms must be a positive integer")
+    if "catchup_enabled" in metadata and type(metadata["catchup_enabled"]) is not bool:
+        raise ProtocolError("catchup_enabled must be a boolean")
+    if metadata.get("voxel_mode", "fixed_window") not in ("event_span", "fixed_window"):
+        raise ProtocolError("voxel_mode must be event_span or fixed_window")
     if len(payload) != metadata["count"] * EVENT_DTYPE.itemsize:
         raise ProtocolError("Event count does not match payload length")
     events = np.frombuffer(payload, dtype=EVENT_DTYPE)
@@ -154,18 +165,21 @@ def validate_events(metadata, payload):
 
 class SessionReceiver:
     def __init__(self, connection, perf, max_batches=DEFAULT_QUEUE_BATCHES,
-                 max_bytes=DEFAULT_QUEUE_BYTES, freshness=True):
+                 max_bytes=DEFAULT_QUEUE_BYTES, freshness=True, catchup_enabled=True):
         self.connection, self.perf = connection, perf
         self.queue = BoundedEventQueue(max_batches, max_bytes)
         self.send_lock = threading.Lock()
         self.done = threading.Event()
+        self.data_ready = threading.Event()
         self.failed = threading.Event()
         self.error = None
         self.session_id = None
+        self.session_config = None
         self.received_batches = self.received_events = 0
         self.rejected_batches = self.rejected_events = 0
         self.rejected_bytes = 0
         self.freshness = freshness
+        self.catchup_enabled = catchup_enabled
         self.recovery_lock = threading.RLock()
         self.processing_generation = 0
         self.generation_claimed = False
@@ -210,7 +224,8 @@ class SessionReceiver:
 
     def _trim(self, incoming=None):
         reason, discarded = self.queue.trim(time.monotonic_ns(), incoming,
-                                             self.freshness, self.catching_up)
+                                             self.freshness, self.catching_up,
+                                             self.catchup_enabled)
         if discarded[0]:
             self.rejected_batches += discarded[0]
             self.rejected_events += discarded[1]
@@ -225,7 +240,13 @@ class SessionReceiver:
             item = self.queue.get()
             if item is not None:
                 self.generation_claimed = True
+            if self.queue.snapshot()["batches"] == 0:
+                self.data_ready.clear()
             return item
+
+    def wait_for_data(self, timeout):
+        self.data_ready.wait(timeout)
+        self.data_ready.clear()
 
     def send_status(self):
         with self.recovery_lock:
@@ -270,6 +291,15 @@ class SessionReceiver:
                     self.session_id = metadata["session_id"]
                 elif self.session_id != metadata["session_id"]:
                     raise ProtocolError("A TCP connection cannot mix acquisition sessions")
+                config = (metadata.get("window_ms"), metadata["width"], metadata["height"],
+                          metadata.get("catchup_enabled", self.catchup_enabled),
+                          metadata.get("voxel_mode", "fixed_window"))
+                if self.session_config is None:
+                    self.session_config = config
+                    self.catchup_enabled = config[3]
+                elif self.session_config != config:
+                    raise ProtocolError(
+                        "A TCP connection cannot change window, resolution, catch-up or voxel mode")
                 self.perf.elapsed("bridge_unpack", tick, events=len(events),
                                   batch_seq=metadata["batch_seq"])
                 received_ns = time.monotonic_ns()
@@ -293,6 +323,7 @@ class SessionReceiver:
                         self._recover("bridge_queue_overflow")
                     metadata["processing_generation"] = self.processing_generation
                     self._trim(((events, metadata, received_ns), len(payload)))
+                    self.data_ready.set()
                 observe_queue(self.perf, self.queue)
         except ConnectionResetError:
             # Stop may close the peer with unread status/result bytes, yielding
@@ -303,6 +334,7 @@ class SessionReceiver:
                 self.fail("protocol_or_connection_error", error)
         finally:
             self.done.set()
+            self.data_ready.set()
 
     def close(self):
         self.done.set()
@@ -489,49 +521,320 @@ class ResultProcessor:
                     result_queue_peak=self.queue_peak)
 
 
-def run_session(connection, model, device, args, perf, should_stop):
-    receiver = SessionReceiver(connection, perf, max_batches=args.queue_batches,
-                               freshness=getattr(args, "freshness", True))
-    windows = EventWindowBuffer(round(args.window_ms * 1e6))
+class IncrementalSessionPipeline:
+    """Drain the existing host FIFO and build fixed-window voxels concurrently."""
+
+    def __init__(self, receiver, first_item, device, perf, should_stop,
+                 window_ms, resolution):
+        self.receiver = receiver
+        self.pending = deque([first_item])
+        self.perf = perf
+        self.should_stop = should_stop
+        self.stopping = threading.Event()
+        self.router = IncrementalWindowRouter(round(window_ms * 1e6))
+        self.voxelizer = IncrementalVoxelizer(
+            resolution[0], resolution[1], round(window_ms * 1e6), device, perf,
+            pool_size=3, staging_slots=2, microbatch_max_events=65536,
+            microbatch_max_wait_ms=2, should_stop=self._cancelled)
+        self.active_generation = first_item[1]["processing_generation"]
+        self.skipped_window_events = 0
+        self.skipped_partial_events = 0
+        self.small_windows = 0
+        self.small_window_events = 0
+        self.pending_window_events = 0
+        self.last_bridge_generation = first_item[1].get("bridge_generation", 0)
+        self.thread = threading.Thread(
+            target=self._run, name="e2fai-voxel-builder", daemon=True)
+        self.thread.start()
+
+    def _cancelled(self):
+        return (self.stopping.is_set() or self.receiver.done.is_set()
+                or self.receiver.failed.is_set() or self.should_stop())
+
+    def _reset_generation(self, generation):
+        self.skipped_partial_events += self.router.buffered_events
+        previous_discarded = self.router.discarded_partial_events
+        self.router.reset(self.receiver.recovery_reason, self.voxelizer.abort_current)
+        self.router.discarded_partial_events = previous_discarded
+        self.router.previous_batch = self.router.previous_ros_sequence = None
+        self.voxelizer.invalidate_generation(generation)
+        self.active_generation = generation
+
+    def _append_chunk(self, events, start_ns, end_ns):
+        if not self.voxelizer.append(
+                events, start_ns, end_ns, self.active_generation):
+            raise RuntimeError("Incremental voxelizer stopped while appending events")
+
+    def _finish_window(self, routed):
+        metadata = routed.metadata
+        metadata.update(processing_generation=self.active_generation,
+                        bridge_generation=self.last_bridge_generation)
+        count = metadata["event_count"]
+        if count < 2:
+            self.small_windows += 1
+            self.small_window_events += count
+            self.voxelizer.abort_current(count)
+            return
+        self.voxelizer.finish_window(metadata)
+        self.pending_window_events += count
+
+    def _run(self):
+        try:
+            while not self._cancelled():
+                if self.active_generation != self.receiver.processing_generation:
+                    self._reset_generation(self.receiver.processing_generation)
+                self.voxelizer.flush_due()
+                item = self.pending.popleft() if self.pending else self.receiver.take()
+                if item is None:
+                    self.receiver.wait_for_data(self.voxelizer.seconds_until_flush())
+                    continue
+                events, metadata, received_ns = item
+                generation = metadata["processing_generation"]
+                if generation != self.active_generation:
+                    self._reset_generation(generation)
+                if (self.receiver.catchup_enabled and self.receiver.freshness
+                        and time.monotonic_ns() - received_ns > WAIT_LIMIT_NS
+                        and self.active_generation == self.receiver.processing_generation):
+                    self.skipped_window_events += len(events)
+                    self.receiver.recover("window_freshness")
+                    self._reset_generation(self.receiver.processing_generation)
+                    continue
+                observe_queue(self.perf, self.receiver.queue)
+                if self.perf.enabled:
+                    self.perf.observe(
+                        "host_fifo_wait", (time.monotonic_ns() - received_ns) / 1e6,
+                        events=len(events), batch_seq=metadata["batch_seq"])
+                metadata["input_complete_ns"] = received_ns
+                self.last_bridge_generation = metadata.get("bridge_generation", 0)
+                previous_ros_gaps = self.router.ros_sequence_gap_incidents
+                tick = self.perf.tick()
+                self.router.push(events, metadata, self._append_chunk,
+                                 self._finish_window, self.voxelizer.abort_current)
+                self.perf.increment(
+                    "ros_sequence_gap_incidents",
+                    self.router.ros_sequence_gap_incidents - previous_ros_gaps)
+                self.perf.elapsed(
+                    "window_route", tick, events=len(events),
+                    batch_seq=metadata["batch_seq"])
+        except (OSError, ValueError, RuntimeError) as error:
+            if not self._cancelled():
+                self.receiver.fail("incremental_voxel_error", error)
+        finally:
+            self.stopping.set()
+
+    def close(self):
+        self.stopping.set()
+        self.thread.join(timeout=2)
+        if self.thread.is_alive():
+            raise RuntimeError("Incremental voxel thread did not stop")
+        self.pending_window_events = sum(
+            slot.event_count for slot in self.voxelizer.slots
+            if slot.state in ("READY", "INFERENCING"))
+        return self.voxelizer.close()
+
+
+def _run_incremental_session(receiver, first_item, model, device, args, perf, should_stop):
+    metadata = first_item[1]
+    session_window_ms = int(metadata.get("window_ms", args.window_ms))
+    session_resolution = (int(metadata["width"]), int(metadata["height"]))
+    flow_max_px = (getattr(args, "flow_max_px_override", None)
+                   if getattr(args, "flow_max_px_override", None) is not None
+                   else 200.0 * session_window_ms / 1000.0)
+    results = ResultProcessor(receiver, perf, flow_max_px,
+                              getattr(args, "result_mode", "thread"), should_stop)
+    pipeline = IncrementalSessionPipeline(
+        receiver, first_item, device, perf, should_stop,
+        session_window_ms, session_resolution)
     state = None
     state_generation = None
-    results = ResultProcessor(receiver, perf, args.flow_max_px,
-                              getattr(args, "result_mode", "thread"), should_stop)
+    state_processing_generation = None
+    inference_count = input_events = skipped_inferences = 0
+    summary = {}
+    try:
+        while not should_stop() and not receiver.done.is_set():
+            if results.mode == "inline":
+                receiver.send_status()
+            generation = receiver.processing_generation
+            if generation != state_processing_generation:
+                state = None
+                state_generation = None
+                state_processing_generation = generation
+            slot = pipeline.voxelizer.acquire_ready(generation, timeout=0.01)
+            if slot is None:
+                continue
+            window = slot.metadata
+            window_tick = perf.tick()
+            gpu_start = gpu_end = None
+            try:
+                if window["reset_count"] != state_generation:
+                    state = None
+                    state_generation = window["reset_count"]
+                if perf.enabled and device.type == "cuda":
+                    gpu_start = torch.cuda.Event(enable_timing=True)
+                    gpu_end = torch.cuda.Event(enable_timing=True)
+                tick = perf.tick()
+                with pipeline.voxelizer.inference_scope(slot):
+                    if gpu_start is not None:
+                        gpu_start.record(pipeline.voxelizer.inference_stream)
+                    with torch.inference_mode():
+                        output, state = model.forward_step(slot.voxel, state)
+                    if gpu_end is not None:
+                        gpu_end.record(pipeline.voxelizer.inference_stream)
+                    perf.elapsed("model_submit", tick, events=slot.event_count,
+                                 window_id=window["window_id"])
+                    tick = perf.tick()
+                    finite = all(torch.isfinite(output[key]).all()
+                                 for key in ("log_image", "flow"))
+                    perf.elapsed("output_ready_and_finite_check", tick,
+                                 events=slot.event_count, window_id=window["window_id"])
+                    if not finite:
+                        raise RuntimeError("Model produced nonfinite output")
+                    state = state.detach()
+                    tick = perf.tick()
+                    snapshot = snapshot_output(output)
+                    copy_ms = ((time.perf_counter_ns() - tick) / 1e6
+                               if perf.enabled else 0)
+                if gpu_end is not None:
+                    gpu_end.synchronize()
+                    perf.observe("model_cuda_forward", gpu_start.elapsed_time(gpu_end),
+                                 events=slot.event_count, window_id=window["window_id"])
+                pipeline.voxelizer.observe_inference_start(slot)
+            finally:
+                pipeline.voxelizer.release(slot)
+            inference_count += 1
+            input_events += window["event_count"]
+            pipeline.pending_window_events = max(
+                0, pipeline.pending_window_events - window["event_count"])
+            if window["processing_generation"] != receiver.processing_generation:
+                skipped_inferences += 1
+                state = None
+                continue
+            perf.observe("result_cpu_copy", copy_ms, events=window["event_count"],
+                         window_id=window["window_id"])
+            perf.elapsed("inference_to_cpu_snapshot", window_tick,
+                         events=window["event_count"], window_id=window["window_id"])
+            if not results.submit(snapshot, window, window["event_count"], copy_ms):
+                break
+    except (BrokenPipeError, ConnectionResetError):
+        receiver.done.set()
+    except (OSError, ValueError, RuntimeError) as error:
+        receiver.fail("inference_or_send_error", error)
+    finally:
+        discarded_batches, discarded_events = receiver.close()
+        try:
+            voxel_summary = pipeline.close()
+        except RuntimeError as error:
+            voxel_summary = pipeline.voxelizer.summary()
+            if receiver.error is None:
+                receiver.error = {"session_id": receiver.session_id,
+                                  "code": "incremental_shutdown_error", "message": str(error)}
+        summary.update(results.close())
+        router = pipeline.router
+        summary.update(
+            session_id=receiver.session_id, results=results.result_count,
+            result_mode=results.mode, inferred_windows=inference_count,
+            inferred_events=input_events, received_batches=receiver.received_batches,
+            received_events=receiver.received_events,
+            overload_rejected_batches=receiver.rejected_batches,
+            overload_rejected_events=receiver.rejected_events,
+            catchup_count=receiver.recovery_count,
+            catchup_discarded_batches=receiver.rejected_batches,
+            catchup_discarded_events=receiver.rejected_events,
+            catchup_discarded_bytes=receiver.rejected_bytes,
+            catchup_complete_window_events=pipeline.skipped_window_events,
+            catchup_partial_window_events=pipeline.skipped_partial_events,
+            catchup_stale_inferences=skipped_inferences,
+            catchup_enabled=receiver.catchup_enabled, freshness_enabled=receiver.freshness,
+            queue_trigger_bytes=QUEUE_TRIGGER_BYTES, queue_target_bytes=QUEUE_TARGET_BYTES,
+            wait_limit_ms=WAIT_LIMIT_NS / 1e6, wait_target_ms=WAIT_TARGET_NS / 1e6,
+            pending_batches_cleared_on_disconnect=discarded_batches,
+            pending_events_cleared_on_disconnect=discarded_events,
+            partial_window_events_at_disconnect=router.buffered_events,
+            partial_events_cleared_on_time_reset=router.discarded_partial_events,
+            complete_window_events_cleared_on_disconnect=pipeline.pending_window_events,
+            reset_count=router.reset_count, last_reset_reason=router.reset_reason,
+            ros_sequence_tracking=router.ros_sequence_tracking,
+            ros_sequence_gap_incidents=router.ros_sequence_gap_incidents,
+            ros_sequence_forward_missing=router.ros_sequence_forward_missing,
+            ros_sequence_unconfirmed_batches=router.ros_sequence_unknown_batches,
+            fewer_than_two_event_windows=pipeline.small_windows,
+            fewer_than_two_event_window_events=pipeline.small_window_events,
+            empty_windows=router.empty_windows, voxel_mode="fixed_window",
+            window_ms=session_window_ms, resolution=list(session_resolution),
+            queue_peak_batches=receiver.queue.peak_batches,
+            queue_peak_bytes=receiver.queue.peak_bytes, error=receiver.error)
+        summary.update(voxel_summary)
+        state = None
+    return summary
+
+
+def _run_event_span_session(receiver, model, device, args, perf, should_stop, first_item=None):
+    windows = None
+    state = None
+    state_generation = None
+    results = None
+    session_window_ms = None
+    session_resolution = None
     inference_count = input_events = small_windows = small_window_events = 0
     pending_window_events = 0
     active_generation = 0
     skipped_window_events = skipped_partial_events = skipped_inferences = 0
     summary = {}
+    pending_items = deque([first_item]) if first_item is not None else deque()
 
     def reset_catchup_state(generation):
         nonlocal skipped_partial_events, state, state_generation, active_generation
-        skipped_partial_events += windows.buffered_events
-        previous_discarded = windows.discarded_partial_events
-        windows.reset(receiver.recovery_reason)
-        windows.discarded_partial_events = previous_discarded
-        windows.previous_batch = windows.previous_ros_sequence = None
+        if windows is not None:
+            skipped_partial_events += windows.buffered_events
+            previous_discarded = windows.discarded_partial_events
+            windows.reset(receiver.recovery_reason)
+            windows.discarded_partial_events = previous_discarded
+            windows.previous_batch = windows.previous_ros_sequence = None
         state = state_generation = None
         active_generation = generation
 
     try:
         while not should_stop() and not receiver.done.is_set():
-            if results.mode == "inline":
+            if results is not None and results.mode == "inline":
                 receiver.send_status()
-            item = receiver.take()
+            item = pending_items.popleft() if pending_items else receiver.take()
             if item is None:
                 if active_generation != receiver.processing_generation:
                     reset_catchup_state(receiver.processing_generation)
                 receiver.done.wait(0.01)
                 continue
             events, metadata, received_ns = item
+            batch_window_ms = int(metadata.get("window_ms", args.window_ms))
+            batch_resolution = (int(metadata["width"]), int(metadata["height"]))
+            batch_catchup_enabled = metadata.get(
+                "catchup_enabled", getattr(args, "catchup_enabled", True))
+            batch_voxel_mode = metadata.get("voxel_mode", getattr(args, "voxel_mode", "fixed_window"))
+            allowed_resolutions = set(RESOLUTION_OPTIONS) | {(args.sensor_width, args.sensor_height)}
+            allowed_windows = set(WINDOW_OPTIONS_MS) | {int(args.window_ms)}
+            if session_window_ms is None:
+                if batch_window_ms not in allowed_windows or batch_resolution not in allowed_resolutions:
+                    receiver.fail("unsupported_session_config",
+                                  "Unsupported window or processing resolution")
+                    break
+                session_window_ms = batch_window_ms
+                session_resolution = batch_resolution
+                windows = EventWindowBuffer(round(session_window_ms * 1e6))
+                flow_max_px = (getattr(args, "flow_max_px_override", None)
+                               if getattr(args, "flow_max_px_override", None) is not None
+                               else 200.0 * session_window_ms / 1000.0)
+                results = ResultProcessor(receiver, perf, flow_max_px,
+                                          getattr(args, "result_mode", "thread"), should_stop)
+            elif (batch_window_ms != session_window_ms or batch_resolution != session_resolution
+                  or batch_catchup_enabled != receiver.catchup_enabled
+                  or batch_voxel_mode != "event_span"):
+                receiver.fail("session_config_changed",
+                              "Window, resolution, catch-up or voxel mode changed inside a session")
+                break
             batch_generation = metadata["processing_generation"]
             if batch_generation != active_generation:
                 # Track intentional drops separately from source publication gaps.
                 reset_catchup_state(batch_generation)
             observe_queue(perf, receiver.queue)
-            if (metadata["width"], metadata["height"]) != (args.sensor_width, args.sensor_height):
-                receiver.fail("resolution_mismatch", "Event resolution does not match model configuration")
-                break
             if perf.enabled:
                 perf.observe("host_fifo_wait", (time.monotonic_ns() - received_ns) / 1e6,
                              events=len(events), batch_seq=metadata["batch_seq"])
@@ -555,7 +858,8 @@ def run_session(connection, model, device, args, perf, should_stop):
             for window in assembled:
                 if receiver.done.is_set() or should_stop():
                     break
-                if (receiver.freshness and time.monotonic_ns() - received_ns > WAIT_LIMIT_NS
+                if (receiver.catchup_enabled and receiver.freshness
+                        and time.monotonic_ns() - received_ns > WAIT_LIMIT_NS
                         and active_generation == receiver.processing_generation):
                     receiver.recover("window_freshness")
                 if active_generation != receiver.processing_generation:
@@ -578,8 +882,9 @@ def run_session(connection, model, device, args, perf, should_stop):
                     state_generation = generation
                 tick = perf.tick()
                 window_tick = tick
-                voxel = voxelize(window.events, args.sensor_width, args.sensor_height, device,
-                                 args.sensor_width, args.sensor_height)
+                sensor_width, sensor_height = session_resolution
+                voxel = voxelize(window.events, sensor_width, sensor_height, device,
+                                 sensor_width, sensor_height)
                 if perf.enabled and device.type == "cuda":
                     torch.cuda.synchronize(device)
                 perf.elapsed("voxel_build", tick, events=len(window.events),
@@ -637,9 +942,23 @@ def run_session(connection, model, device, args, perf, should_stop):
         receiver.fail("inference_or_send_error", error)
     finally:
         discarded_batches, discarded_events = receiver.close()
-        summary.update(results.close())
-        summary.update(session_id=receiver.session_id, results=results.result_count,
-                       result_mode=results.mode,
+        summary.update(results.close() if results is not None else
+                       dict(pending_results_cleared_on_disconnect=0,
+                            pending_result_events_cleared_on_disconnect=0,
+                            catchup_stale_results=0, catchup_stale_result_events=0,
+                            result_queue_peak=0))
+        buffered_events = windows.buffered_events if windows is not None else 0
+        discarded_partial_events = windows.discarded_partial_events if windows is not None else 0
+        reset_count = windows.reset_count if windows is not None else 0
+        reset_reason = windows.reset_reason if windows is not None else "session_start"
+        ros_tracking = windows.ros_sequence_tracking if windows is not None else "unconfirmed"
+        ros_gap_incidents = windows.ros_sequence_gap_incidents if windows is not None else 0
+        ros_forward_missing = windows.ros_sequence_forward_missing if windows is not None else 0
+        ros_unknown_batches = windows.ros_sequence_unknown_batches if windows is not None else 0
+        empty_windows = windows.empty_windows if windows is not None else 0
+        summary.update(session_id=receiver.session_id,
+                       results=results.result_count if results is not None else 0,
+                       result_mode=results.mode if results is not None else getattr(args, "result_mode", "thread"),
                        inferred_windows=inference_count,
                        inferred_events=input_events, received_batches=receiver.received_batches,
                        received_events=receiver.received_events,
@@ -652,41 +971,81 @@ def run_session(connection, model, device, args, perf, should_stop):
                        catchup_complete_window_events=skipped_window_events,
                        catchup_partial_window_events=skipped_partial_events,
                        catchup_stale_inferences=skipped_inferences,
+                       catchup_enabled=receiver.catchup_enabled,
                        freshness_enabled=receiver.freshness,
                        queue_trigger_bytes=QUEUE_TRIGGER_BYTES, queue_target_bytes=QUEUE_TARGET_BYTES,
                        wait_limit_ms=WAIT_LIMIT_NS / 1e6, wait_target_ms=WAIT_TARGET_NS / 1e6,
                        pending_batches_cleared_on_disconnect=discarded_batches,
                        pending_events_cleared_on_disconnect=discarded_events,
-                       partial_window_events_at_disconnect=windows.buffered_events,
-                       partial_events_cleared_on_time_reset=windows.discarded_partial_events,
+                       partial_window_events_at_disconnect=buffered_events,
+                       partial_events_cleared_on_time_reset=discarded_partial_events,
                        complete_window_events_cleared_on_disconnect=pending_window_events,
-                       reset_count=windows.reset_count, last_reset_reason=windows.reset_reason,
-                       ros_sequence_tracking=windows.ros_sequence_tracking,
-                       ros_sequence_gap_incidents=windows.ros_sequence_gap_incidents,
-                       ros_sequence_forward_missing=windows.ros_sequence_forward_missing,
-                       ros_sequence_unconfirmed_batches=windows.ros_sequence_unknown_batches,
+                       reset_count=reset_count, last_reset_reason=reset_reason,
+                       ros_sequence_tracking=ros_tracking,
+                       ros_sequence_gap_incidents=ros_gap_incidents,
+                       ros_sequence_forward_missing=ros_forward_missing,
+                       ros_sequence_unconfirmed_batches=ros_unknown_batches,
                        fewer_than_two_event_windows=small_windows,
                        fewer_than_two_event_window_events=small_window_events,
-                       empty_windows=windows.empty_windows,
+                       empty_windows=empty_windows,
+                       voxel_mode="event_span",
+                       window_ms=session_window_ms if session_window_ms is not None else args.window_ms,
+                       resolution=list(session_resolution or (args.sensor_width, args.sensor_height)),
                        queue_peak_batches=receiver.queue.peak_batches,
                        queue_peak_bytes=receiver.queue.peak_bytes, error=receiver.error)
         # Session locals own all event chunks, display normalization and GRU state.
         state = None
-        windows.parts.clear()
+        if windows is not None:
+            windows.parts.clear()
     return summary
+
+
+def run_session(connection, model, device, args, perf, should_stop):
+    receiver = SessionReceiver(connection, perf, max_batches=args.queue_batches,
+                               freshness=getattr(args, "freshness", True),
+                               catchup_enabled=getattr(args, "catchup_enabled", True))
+    first_item = None
+    while not should_stop() and not receiver.done.is_set():
+        first_item = receiver.take()
+        if first_item is not None:
+            break
+        receiver.done.wait(0.01)
+    if first_item is None:
+        return _run_event_span_session(
+            receiver, model, device, args, perf, should_stop)
+    metadata = first_item[1]
+    window_ms = int(metadata.get("window_ms", args.window_ms))
+    resolution = (int(metadata["width"]), int(metadata["height"]))
+    voxel_mode = metadata.get("voxel_mode", getattr(args, "voxel_mode", "fixed_window"))
+    allowed_resolutions = set(RESOLUTION_OPTIONS) | {(args.sensor_width, args.sensor_height)}
+    allowed_windows = set(WINDOW_OPTIONS_MS) | {int(args.window_ms)}
+    if window_ms not in allowed_windows or resolution not in allowed_resolutions:
+        receiver.fail("unsupported_session_config", "Unsupported window or processing resolution")
+        return _run_event_span_session(
+            receiver, model, device, args, perf, should_stop, first_item)
+    if voxel_mode == "fixed_window":
+        return _run_incremental_session(
+            receiver, first_item, model, device, args, perf, should_stop)
+    return _run_event_span_session(
+        receiver, model, device, args, perf, should_stop, first_item)
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--window-ms", type=float, default=250.0)
+    parser.add_argument("--window-ms", type=float, default=200.0)
     parser.add_argument("--result-mode", choices=("inline", "thread"), default="thread",
                         help="CPU rendering/packing and TCP sending mode (default: thread)")
+    parser.add_argument("--voxel-mode", choices=("event_span", "fixed_window"),
+                        default="fixed_window",
+                        help="Voxel timestamp normalization and construction mode")
     parser.add_argument("--queue-batches", type=int, default=DEFAULT_QUEUE_BATCHES,
-                        help="Host FIFO batch limit; byte limit is 2 GiB (2048 MiB)")
+                        help="Host FIFO batch limit; byte hard limit is 4 GiB (4096 MiB)")
     parser.add_argument("--no-freshness", dest="freshness", action="store_false",
                         help="Disable waiting-time catch-up only; capacity catch-up remains enabled")
+    parser.add_argument("--no-catchup", dest="catchup_enabled", action="store_false",
+                        help="Disable proactive host FIFO catch-up; hard limits still discard the oldest data")
     parser.add_argument("--sensor-width", type=int, default=960)
     parser.add_argument("--sensor-height", type=int, default=720)
     parser.add_argument("--backbone", type=Path, required=True)
@@ -698,14 +1057,14 @@ def parse_args(argv=None):
     parser.add_argument("--perf-enabled", action="store_true")
     parser.add_argument("--perf-interval", type=float, default=5.0)
     args = parser.parse_args(argv)
+    args.flow_max_px_override = args.flow_max_px
     if args.flow_max_px is None:
         args.flow_max_px = 200.0 * args.window_ms / 1000.0
     if args.host != "127.0.0.1":
         parser.error("The integration is local-only; --host must be 127.0.0.1")
-    if (not 0 < args.port < 65536 or args.window_ms <= 0 or args.flow_max_px <= 0
+    if (not 0 < args.port < 65536 or args.window_ms not in WINDOW_OPTIONS_MS or args.flow_max_px <= 0
             or args.queue_batches < 1
-            or min(args.sensor_width, args.sensor_height) <= 0
-            or args.sensor_width % 16 or args.sensor_height % 16):
+            or (args.sensor_width, args.sensor_height) not in RESOLUTION_OPTIONS):
         parser.error("Port, timing, queue batch limit, flow scale or native dimensions are invalid")
     return args
 
@@ -720,10 +1079,12 @@ def main(argv=None):
         raise RuntimeError("CUDA was requested but is unavailable")
     model, model_metadata = load_recurrent_model(
         args.image_checkpoint, backbone_checkpoint=args.backbone, device=device,
-        sensor_height=args.sensor_height, sensor_width=args.sensor_width)
+        sensor_height=args.sensor_height, sensor_width=args.sensor_width,
+        supported_resolutions=RESOLUTION_OPTIONS)
     torch.backends.cudnn.benchmark = False
     with torch.inference_mode():
-        model.forward_step(torch.zeros(1, NUM_BINS, args.sensor_height, args.sensor_width, device=device))
+        for width, height in RESOLUTION_OPTIONS:
+            model.forward_step(torch.zeros(1, NUM_BINS, height, width, device=device))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     stop = threading.Event()
@@ -760,9 +1121,8 @@ def main(argv=None):
             summary = run_session(connection, model, device, args, perf, stop.is_set)
             active[0] = None
             sessions += 1
-            summary.update(model=model_metadata, window_ms=args.window_ms,
+            summary.update(model=model_metadata,
                            queue_max_batches=args.queue_batches, queue_max_bytes=DEFAULT_QUEUE_BYTES,
-                           resolution=[args.sensor_width, args.sensor_height],
                            event_subsampling_enabled=False, perf_enabled=args.perf_enabled,
                            timestamp_source="group_aer_corrected_sensor_clock_ros_anchor")
             token = hashlib.sha256(str(summary["session_id"]).encode()).hexdigest()[:12]
